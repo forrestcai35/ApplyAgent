@@ -26,7 +26,7 @@ console = Console()
 log = logging.getLogger(__name__)
 
 # Valid pipeline stages (in execution order)
-VALID_STAGES = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+VALID_STAGES = ("discover", "dedup", "enrich", "score", "tailor", "cover", "pdf")
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +152,7 @@ def apply(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
+    skip_tailor: bool = typer.Option(False, "--skip-tailor", help="Apply with your base resume instead of tailored resumes."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
@@ -197,7 +198,23 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # --skip-tailor: assign base resume to scored jobs missing a tailored resume
+    if skip_tailor:
+        from applyagent.config import RESUME_PDF_PATH
+        if not RESUME_PDF_PATH.exists():
+            console.print("[red]No base resume PDF found at[/red] ~/.applyagent/resume.pdf")
+            raise typer.Exit(code=1)
+        conn = get_connection()
+        updated = conn.execute(
+            "UPDATE jobs SET tailored_resume_path = ? "
+            "WHERE fit_score >= ? AND tailored_resume_path IS NULL AND application_url IS NOT NULL",
+            (str(RESUME_PDF_PATH), min_score),
+        ).rowcount
+        conn.commit()
+        if updated:
+            console.print(f"[green]--skip-tailor:[/green] {updated} job(s) set to use base resume")
+
+    # Check 3: Jobs ready to apply (skip for --gen with --url)
     if not (gen and url):
         conn = get_connection()
         ready = conn.execute(
@@ -205,8 +222,8 @@ def apply(
         ).fetchone()[0]
         if ready == 0:
             console.print(
-                "[red]No tailored resumes ready.[/red]\n"
-                "Run [bold]applyagent run score tailor[/bold] first to prepare applications."
+                "[red]No jobs ready to apply.[/red]\n"
+                "Run [bold]applyagent run score tailor[/bold] first, or use [bold]--skip-tailor[/bold] to apply with your base resume."
             )
             raise typer.Exit(code=1)
 
@@ -273,6 +290,7 @@ def status() -> None:
     summary.add_column("Count", justify="right")
 
     summary.add_row("Total jobs discovered", str(stats["total"]))
+    summary.add_row("Duplicates filtered", str(stats.get("duplicates", 0)))
     summary.add_row("With full description", str(stats["with_description"]))
     summary.add_row("Pending enrichment", str(stats["pending_detail"]))
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))

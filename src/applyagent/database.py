@@ -92,12 +92,16 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Discovery stage (smart_extract / job_search)
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
+            company               TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
+
+            -- Deduplication
+            duplicate_of          TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -147,12 +151,15 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    # Deduplication
+    "duplicate_of": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -248,9 +255,14 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     ).fetchall()
     stats["by_site"] = [(row[0], row[1]) for row in rows]
 
-    # Enrichment stage
+    # Deduplication
+    stats["duplicates"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE duplicate_of IS NOT NULL"
+    ).fetchone()[0]
+
+    # Enrichment stage (excludes duplicates)
     stats["pending_detail"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL"
+        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of IS NULL"
     ).fetchone()[0]
 
     stats["with_description"] = conn.execute(
@@ -332,7 +344,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
 
     Args:
         conn: Database connection.
-        jobs: List of job dicts with keys: url, title, salary, description, location.
+        jobs: List of job dicts with keys: url, title, salary, description, location, company.
         site: Source site name (e.g. "RemoteOK", "Dice").
         strategy: Extraction strategy used (e.g. "json_ld", "api_response", "css_selectors").
 
@@ -349,10 +361,10 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), job.get("company"), job.get("salary"),
+                 job.get("description"), job.get("location"), site, strategy, now),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -380,22 +392,25 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if conn is None:
         conn = get_connection()
 
+    # All stages except "discovered" exclude rows marked as duplicates
+    _no_dup = "duplicate_of IS NULL"
     conditions = {
         "discovered": "1=1",
-        "pending_detail": "detail_scraped_at IS NULL",
-        "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
-        "scored": "fit_score IS NOT NULL",
+        "pending_detail": f"detail_scraped_at IS NULL AND {_no_dup}",
+        "enriched": f"full_description IS NOT NULL AND {_no_dup}",
+        "pending_score": f"full_description IS NOT NULL AND fit_score IS NULL AND {_no_dup}",
+        "scored": f"fit_score IS NOT NULL AND {_no_dup}",
         "pending_tailor": (
-            "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            f"fit_score >= ? AND full_description IS NOT NULL "
+            f"AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5 AND {_no_dup}"
         ),
-        "tailored": "tailored_resume_path IS NOT NULL",
+        "tailored": f"tailored_resume_path IS NOT NULL AND {_no_dup}",
         "pending_apply": (
-            "tailored_resume_path IS NOT NULL AND applied_at IS NULL "
-            "AND application_url IS NOT NULL"
+            f"tailored_resume_path IS NOT NULL AND applied_at IS NULL "
+            f"AND application_url IS NOT NULL AND {_no_dup}"
         ),
         "applied": "applied_at IS NOT NULL",
+        "duplicates": "duplicate_of IS NOT NULL",
     }
 
     where = conditions.get(stage, "1=1")

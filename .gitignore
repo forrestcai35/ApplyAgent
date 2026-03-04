@@ -5,6 +5,8 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+user_data/
+
 
 # Runtime artifacts
 *.db
@@ -39,3 +41,6 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Virtual environment
+.venv/

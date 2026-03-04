@@ -53,6 +53,9 @@ _stop_event = threading.Event()
 _claude_procs: dict[int, subprocess.Popen] = {}
 _claude_lock = threading.Lock()
 
+# Ctrl+C counter: list wrapper so signal handler and worker loop can share it
+_ctrl_c_state = {"count": 0}
+
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
 if platform.system() != "Windows":
@@ -132,6 +135,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
+                  AND duplicate_of IS NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
@@ -201,6 +205,16 @@ def release_lock(url: str) -> None:
     conn = get_connection()
     conn.execute(
         "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
+        (url,),
+    )
+    conn.commit()
+
+
+def mark_skipped(url: str) -> None:
+    """Mark a job as user-skipped so it won't be re-acquired this session."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE jobs SET apply_status = 'skipped', agent_id = NULL WHERE url = ?",
         (url,),
     )
     conn.commit()
@@ -379,6 +393,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             errors="replace",
             env=env,
             cwd=str(worker_dir),
+            start_new_session=True,
         )
         with _claude_lock:
             _claude_procs[worker_id] = proc
@@ -446,7 +461,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc = None
 
         if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
+            # Only treat as a user-initiated skip if Ctrl+C was pressed recently
+            # (within last 5 seconds). Otherwise it's a process crash.
+            if time.time() - _ctrl_c_state.get("last_time", 0) < 5.0:
+                return "skipped", int((time.time() - start) * 1000)
+            duration_ms = int((time.time() - start) * 1000)
+            add_event(f"[W{worker_id}] CRASHED (signal {-returncode}, {duration_ms // 1000}s)")
+            update_state(worker_id, status="failed",
+                         last_action=f"crashed (signal {-returncode})")
+            return f"failed:process_crashed", duration_ms
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
@@ -495,6 +518,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
+        # If Claude exited in under 15s with no result, the job is almost
+        # certainly broken (bad URL, prompt parse error, etc.) -- don't retry.
+        if elapsed < 15:
+            return "failed:instant_failure", duration_ms
         return "failed:no_result_line", duration_ms
 
     except subprocess.TimeoutExpired:
@@ -526,6 +553,7 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "instant_failure",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -568,7 +596,12 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     continuous = limit == 0
     jobs_done = 0
     empty_polls = 0
+    rapid_fails = 0
     port = BASE_CDP_PORT + worker_id
+
+    RAPID_FAIL_THRESHOLD_MS = 15_000
+    MAX_RAPID_FAILS = 5
+    RAPID_FAIL_BASE_DELAY = 30
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -589,9 +622,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                          last_action=f"polling ({empty_polls})")
             if empty_polls == 1:
                 add_event(f"[W{worker_id}] Queue empty, polling every {POLL_INTERVAL}s...")
-            # Use Event.wait for interruptible sleep
             if _stop_event.wait(timeout=POLL_INTERVAL):
-                break  # Stop was requested during wait
+                break
             continue
 
         empty_polls = 0
@@ -605,27 +637,52 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                             model=model, dry_run=dry_run)
 
             if result == "skipped":
-                release_lock(job["url"])
+                mark_skipped(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
+                rapid_fails = 0
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
-                reason = result.split(":", 1)[-1] if ":" in result else result
-                mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms)
-                failed += 1
-                update_state(worker_id, jobs_failed=failed,
-                             jobs_done=applied + failed)
+                is_rapid = duration_ms < RAPID_FAIL_THRESHOLD_MS
+                if is_rapid:
+                    rapid_fails += 1
+                    release_lock(job["url"])
+                    if rapid_fails >= MAX_RAPID_FAILS:
+                        add_event(
+                            f"[W{worker_id}] {rapid_fails} consecutive instant failures — "
+                            f"Claude Code likely rate-limited. Stopping.")
+                        update_state(worker_id, status="rate_limited",
+                                     last_action="rate limited, stopping")
+                        break
+                    delay = RAPID_FAIL_BASE_DELAY * (2 ** (rapid_fails - 1))
+                    add_event(
+                        f"[W{worker_id}] Instant failure ({duration_ms // 1000}s) — "
+                        f"likely rate-limited. Waiting {delay}s before retry "
+                        f"({rapid_fails}/{MAX_RAPID_FAILS})...")
+                    update_state(worker_id, status="backoff",
+                                 last_action=f"rate-limit backoff {delay}s")
+                    if _stop_event.wait(timeout=delay):
+                        break
+                    continue
+                else:
+                    rapid_fails = 0
+                    reason = result.split(":", 1)[-1] if ":" in result else result
+                    mark_result(job["url"], "failed", reason,
+                                permanent=_is_permanent_failure(result),
+                                duration_ms=duration_ms)
+                    failed += 1
+                    update_state(worker_id, jobs_failed=failed,
+                                 jobs_done=applied + failed)
 
         except KeyboardInterrupt:
-            release_lock(job["url"])
             if _stop_event.is_set():
+                release_lock(job["url"])
                 break
+            mark_skipped(job["url"])
             add_event(f"[W{worker_id}] Job skipped (Ctrl+C)")
             continue
         except Exception as e:
@@ -689,15 +746,21 @@ def main(limit: int = 1, target_url: str | None = None,
     console.print(f"Launching apply pipeline ({mode_label}, {worker_label}, poll every {POLL_INTERVAL}s)...")
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
-    # Double Ctrl+C handler
-    _ctrl_c_count = 0
+    # Double Ctrl+C handler: first press skips, rapid second press stops.
+    # Uses module-level _ctrl_c_state so worker_loop can reset after each job.
+    _ctrl_c_state["count"] = 0
+    _ctrl_c_state["last_time"] = 0.0
 
     def _sigint_handler(sig, frame):
-        nonlocal _ctrl_c_count
-        _ctrl_c_count += 1
-        if _ctrl_c_count == 1:
-            console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
+        now = time.time()
+        # Treat as a "new first press" if >3s since last Ctrl+C
+        if now - _ctrl_c_state["last_time"] > 3.0:
+            _ctrl_c_state["count"] = 0
+        _ctrl_c_state["count"] += 1
+        _ctrl_c_state["last_time"] = now
+
+        if _ctrl_c_state["count"] == 1:
+            console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again within 3s to STOP)[/yellow]")
             with _claude_lock:
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:

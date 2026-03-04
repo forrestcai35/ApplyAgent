@@ -32,10 +32,11 @@ console = Console()
 # Stage definitions
 # ---------------------------------------------------------------------------
 
-STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+STAGE_ORDER = ("discover", "dedup", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
+    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract + GitHub repos)"},
+    "dedup":    {"desc": "Deduplication (cross-source near-duplicate detection)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -43,11 +44,10 @@ STAGE_META: dict[str, dict] = {
     "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
 }
 
-# Upstream dependency: a stage only finishes when its upstream is done AND
-# it has no remaining pending work.
 _UPSTREAM: dict[str, str | None] = {
     "discover": None,
-    "enrich":   "discover",
+    "dedup":    "discover",
+    "enrich":   "dedup",
     "score":    "enrich",
     "tailor":   "score",
     "cover":    "tailor",
@@ -60,8 +60,8 @@ _UPSTREAM: dict[str, str | None] = {
 # ---------------------------------------------------------------------------
 
 def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    """Stage: Job discovery — JobSpy, Workday, smart-extract, and GitHub repo scrapers."""
+    stats: dict = {"jobspy": None, "workday": None, "smartextract": None, "github_repos": None}
 
     # JobSpy
     console.print("  [cyan]JobSpy full crawl...[/cyan]")
@@ -96,7 +96,31 @@ def _run_discover(workers: int = 1) -> dict:
         console.print(f"  [red]Smart extract error:[/red] {e}")
         stats["smartextract"] = f"error: {e}"
 
+    # GitHub repo scraper
+    console.print("  [cyan]GitHub repo scraper...[/cyan]")
+    try:
+        from applyagent.discovery.github_repos import run_github_repos
+        run_github_repos(workers=workers)
+        stats["github_repos"] = "ok"
+    except Exception as e:
+        log.error("GitHub repo scraper failed: %s", e)
+        console.print(f"  [red]GitHub repos error:[/red] {e}")
+        stats["github_repos"] = f"error: {e}"
+
     return stats
+
+
+def _run_dedup() -> dict:
+    """Stage: Deduplication — detect and mark cross-source near-duplicates."""
+    try:
+        from applyagent.dedup import run_dedup
+        stats = run_dedup()
+        console.print(f"  [dim]Dedup: {stats['marked']} new duplicates marked "
+                       f"({stats['groups']} groups, {stats['already_marked']} previously marked)[/dim]")
+        return {"status": "ok", **stats}
+    except Exception as e:
+        log.error("Dedup failed: %s", e)
+        return {"status": f"error: {e}"}
 
 
 def _run_enrich(workers: int = 1) -> dict:
@@ -157,6 +181,7 @@ def _run_pdf() -> dict:
 # Map stage names to their runner functions
 _STAGE_RUNNERS: dict[str, callable] = {
     "discover": _run_discover,
+    "dedup":    _run_dedup,
     "enrich":   _run_enrich,
     "score":    _run_score,
     "tailor":   _run_tailor,
@@ -220,23 +245,25 @@ class _StageTracker:
 
 
 # SQL to count pending work for each stage
+_NO_DUP = "AND duplicate_of IS NULL"
 _PENDING_SQL: dict[str, str] = {
-    "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
-    "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
+    "dedup":  "SELECT COUNT(*) FROM jobs WHERE duplicate_of IS NULL",
+    "enrich": f"SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL {_NO_DUP}",
+    "score":  f"SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL {_NO_DUP}",
     "tailor": (
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
-        "AND full_description IS NOT NULL "
-        "AND tailored_resume_path IS NULL "
-        "AND COALESCE(tailor_attempts, 0) < 5"
+        f"SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
+        f"AND full_description IS NOT NULL "
+        f"AND tailored_resume_path IS NULL "
+        f"AND COALESCE(tailor_attempts, 0) < 5 {_NO_DUP}"
     ),
     "cover": (
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
-        "AND COALESCE(cover_attempts, 0) < 5"
+        f"SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        f"AND (cover_letter_path IS NULL OR cover_letter_path = '') "
+        f"AND COALESCE(cover_attempts, 0) < 5 {_NO_DUP}"
     ),
     "pdf": (
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
-        "AND tailored_resume_path LIKE '%.txt'"
+        f"SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL "
+        f"AND tailored_resume_path LIKE '%.txt' {_NO_DUP}"
     ),
 }
 
@@ -485,7 +512,8 @@ def run_pipeline(
 
     # Pre-run stats
     pre_stats = get_stats()
-    console.print(f"  DB:        {pre_stats['total']} jobs, {pre_stats['pending_detail']} pending enrichment")
+    console.print(f"  DB:        {pre_stats['total']} jobs, {pre_stats.get('duplicates', 0)} duplicates, "
+                  f"{pre_stats['pending_detail']} pending enrichment")
 
     if dry_run:
         console.print(f"\n  [yellow]DRY RUN[/yellow] — would execute ({mode}):")

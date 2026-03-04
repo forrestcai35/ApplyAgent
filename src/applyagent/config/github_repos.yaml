@@ -1,0 +1,64 @@
+# GitHub job listing repos — curated markdown/HTML tables of new-grad SWE positions.
+# Add new repos by following the pattern below. No code changes needed.
+
+repos:
+
+  speedyapply:
+    owner: speedyapply
+    repo: 2026-SWE-College-Jobs
+    branch: main
+    file: README.md
+    format: markdown_pipe
+    sections:
+      - name: faang
+        start_marker: "<!-- TABLE_FAANG_START -->"
+        end_marker: "<!-- TABLE_FAANG_END -->"
+        columns:
+          company: 0    # <a href><strong>Name</strong></a>
+          title: 1      # Position
+          location: 2
+          salary: 3
+          apply: 4      # <a href="URL"><img .../></a>
+      - name: quant
+        start_marker: "<!-- TABLE_QUANT_START -->"
+        end_marker: "<!-- TABLE_QUANT_END -->"
+        columns:
+          company: 0
+          title: 1
+          location: 2
+          salary: 3
+          apply: 4
+      - name: other
+        start_marker: "<!-- TABLE_START -->"
+        end_marker: "<!-- TABLE_END -->"
+        columns:
+          company: 0
+          title: 1
+          location: 2
+          apply: 3      # no salary column in this section
+
+  simplifyjobs:
+    owner: SimplifyJobs
+    repo: New-Grad-Positions
+    branch: dev
+    file: README.md
+    format: html_table
+    columns:
+      company: 0        # <strong><a href="...">Name</a></strong>
+      title: 1          # Role
+      location: 2
+      apply: 3          # <a href="URL"><img alt="Apply" .../></a>
+
+  vanshb03:
+    owner: vanshb03
+    repo: New-Grad-2026
+    branch: main
+    file: README.md
+    format: markdown_pipe
+    sections:
+      - name: main
+        columns:
+          company: 0    # **Name**
+          title: 1      # Role
+          location: 2
+          apply: 3      # <a href="URL"><img .../></a>

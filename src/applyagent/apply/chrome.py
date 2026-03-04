@@ -307,15 +307,28 @@ def cleanup_on_exit() -> None:
     """Atexit handler: kill all Chrome processes and sweep CDP ports.
 
     Register this with atexit.register() at application startup.
+    Ignores signals during cleanup to prevent re-entrant crashes.
     """
-    with _chrome_lock:
-        procs = dict(_chrome_procs)
-        _chrome_procs.clear()
+    import signal as _signal
 
-    for wid, proc in procs.items():
-        if proc.poll() is None:
-            _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+    # Ignore SIGINT during cleanup so a stray Ctrl+C doesn't crash
+    # the atexit handler while we're running subprocess.run (lsof).
+    try:
+        _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
+    except (OSError, ValueError):
+        pass  # not main thread or signal not supported
 
-    # Sweep base port for any orphan
-    _kill_on_port(BASE_CDP_PORT)
+    try:
+        with _chrome_lock:
+            procs = dict(_chrome_procs)
+            _chrome_procs.clear()
+
+        for wid, proc in procs.items():
+            if proc.poll() is None:
+                _kill_process_tree(proc.pid)
+            _kill_on_port(BASE_CDP_PORT + wid)
+
+        # Sweep base port for any orphan
+        _kill_on_port(BASE_CDP_PORT)
+    except Exception:
+        pass  # best-effort cleanup, don't crash on exit

@@ -10,6 +10,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 from applyagent import config
 
@@ -417,6 +418,33 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
+def _resolve_apply_url(job: dict) -> str:
+    """Resolve the application URL to an absolute HTTP URL.
+
+    Handles fragments (#applyNow), relative paths (/path/to/apply),
+    and dot-relative paths (./apply?id=...) by joining against the
+    job's main URL.  Falls back to the main URL if the result still
+    isn't a valid HTTP URL.
+    """
+    base = job.get("url", "")
+    raw = job.get("application_url") or ""
+
+    if not raw or raw == base:
+        return base
+
+    # Already absolute
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+
+    # Resolve fragments, relative, and dot-relative paths against the job URL
+    if base.startswith("http"):
+        resolved = urljoin(base, raw)
+        if resolved.startswith("http"):
+            return resolved
+
+    return base
+
+
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False) -> str:
@@ -513,10 +541,12 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
+    apply_url = _resolve_apply_url(job)
+
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 == JOB ==
-URL: {job.get('application_url') or job['url']}
+URL: {apply_url}
 Title: {job['title']}
 Company: {job.get('site', 'Unknown')}
 Fit Score: {job.get('fit_score', 'N/A')}/10
