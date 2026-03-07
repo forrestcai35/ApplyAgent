@@ -147,7 +147,7 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name (ignored with --local)."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -158,6 +158,7 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    local: bool = typer.Option(False, "--local", help="Use local LLM (Ollama/llama.cpp) instead of Claude Code. Completely free."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
@@ -187,8 +188,8 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
-    check_tier(3, "auto-apply")
+    # Check requirements: Tier 3 (Claude Code) or local mode (LLM + Chrome)
+    check_tier(3, "auto-apply", local=local)
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -251,10 +252,13 @@ def apply(
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
 
+    mode_label = "Local LLM" if local else f"Claude Code ({model})"
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
+    console.print(f"  Mode:     {mode_label}")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    if not local:
+        console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -270,6 +274,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        local=local,
     )
 
 
@@ -413,14 +418,35 @@ def doctor() -> None:
         results.append(("LLM API key", fail_mark,
                         "Set GEMINI_API_KEY in ~/.applyagent/.env (run 'applyagent init')"))
 
+    # --- Apply agent model (optional override) ---
+    apply_url = os.environ.get("APPLY_LLM_URL", "")
+    apply_model = os.environ.get("APPLY_LLM_MODEL", "")
+    if apply_url:
+        results.append(("Apply agent LLM", ok_mark,
+                        f"{apply_url} ({apply_model or 'default model'})"))
+    elif apply_model:
+        results.append(("Apply agent LLM", ok_mark,
+                        f"Same server, model: {apply_model}"))
+    else:
+        results.append(("Apply agent LLM", "[dim]not set[/dim]",
+                        "Uses main LLM. Set APPLY_LLM_URL/APPLY_LLM_MODEL for a separate agent model"))
+
+    # --- Auto-fallback ---
+    if (has_gemini or has_openai) and has_local:
+        results.append(("Auto-fallback", ok_mark,
+                        f"Cloud primary → local fallback ({os.environ.get('LLM_URL')}) on rate limit"))
+    elif has_gemini or has_openai:
+        results.append(("Auto-fallback", "[dim]inactive[/dim]",
+                        "Set LLM_URL too for automatic local fallback on rate limits"))
+
     # --- Tier 3 checks ---
     # Claude Code CLI
     claude_bin = shutil.which("claude")
     if claude_bin:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Claude Code CLI", warn_mark,
+                        "Install from https://claude.ai/code, or use --local for free auto-apply"))
 
     # Chrome
     try:
@@ -430,13 +456,13 @@ def doctor() -> None:
         results.append(("Chrome/Chromium", fail_mark,
                         "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
 
-    # Node.js / npx (for Playwright MCP)
+    # Node.js / npx (for Playwright MCP — only needed for Claude Code mode)
     npx_bin = shutil.which("npx")
     if npx_bin:
         results.append(("Node.js (npx)", ok_mark, npx_bin))
     else:
-        results.append(("Node.js (npx)", fail_mark,
-                        "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+        results.append(("Node.js (npx)", warn_mark,
+                        "Needed for Claude Code mode. Not needed for --local"))
 
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")
@@ -458,15 +484,19 @@ def doctor() -> None:
     console.print()
 
     # Tier summary
-    from applyagent.config import get_tier, TIER_LABELS
+    from applyagent.config import get_tier, TIER_LABELS, can_local_apply
     tier = get_tier()
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
+    if can_local_apply():
+        console.print("[green]  → Local auto-apply available![/green] Use [bold]applyagent apply --local[/bold] (free, no Claude Code needed)")
+
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js, or use --local)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply via Claude Code (needs CLI + Node.js)[/dim]")
+        console.print("[dim]  → Or use --local for free auto-apply with your local LLM + Chrome[/dim]")
 
     console.print()
 

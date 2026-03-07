@@ -196,6 +196,9 @@ TIER_COMMANDS: dict[int, list[str]] = {
     3: ["apply"],
 }
 
+# "Local apply" = Tier 2 + Chrome (no Claude Code / Node.js needed)
+TIER_LOCAL_APPLY = "2+"
+
 
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
@@ -223,13 +226,50 @@ def get_tier() -> int:
     return 2
 
 
-def check_tier(required: int, feature: str) -> None:
+def can_local_apply() -> bool:
+    """Check if local auto-apply is possible (LLM + Chrome, no Claude Code)."""
+    load_env()
+    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    if not has_llm:
+        return False
+    try:
+        get_chrome_path()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def check_tier(required: int, feature: str, local: bool = False) -> None:
     """Raise SystemExit with a clear message if the current tier is too low.
 
     Args:
         required: Minimum tier needed (1, 2, or 3).
         feature: Human-readable description of the feature being gated.
+        local: If True, check for local-apply requirements instead of Tier 3.
     """
+    if local and required == 3:
+        # Local apply only needs LLM + Chrome
+        if can_local_apply():
+            return
+        from rich.console import Console
+        _console = Console(stderr=True)
+        missing: list[str] = []
+        if not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
+            missing.append("LLM provider — set LLM_URL for local model (e.g. Ollama at http://localhost:11434/v1)")
+        try:
+            get_chrome_path()
+        except FileNotFoundError:
+            missing.append("Chrome/Chromium — install or set CHROME_PATH")
+        _console.print(
+            f"\n[red]'{feature}' with --local requires an LLM provider + Chrome.[/red]"
+        )
+        if missing:
+            _console.print("\n[yellow]Missing:[/yellow]")
+            for m in missing:
+                _console.print(f"  - {m}")
+        _console.print()
+        raise SystemExit(1)
+
     current = get_tier()
     if current >= required:
         return
@@ -242,7 +282,7 @@ def check_tier(required: int, feature: str) -> None:
         missing.append("LLM API key — run [bold]applyagent init[/bold] or set GEMINI_API_KEY")
     if required >= 3:
         if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold] (or use [bold]--local[/bold] for free local model)")
         try:
             get_chrome_path()
         except FileNotFoundError:

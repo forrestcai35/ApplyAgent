@@ -24,25 +24,35 @@ log = logging.getLogger(__name__)
 def _detect_provider() -> tuple[str, str, str]:
     """Return (base_url, model, api_key) based on environment variables.
 
-    Reads env at call time (not module import time) so that load_env() called
-    in _bootstrap() is always visible here.
+    Priority: cloud APIs first (Gemini > OpenAI), then LLM_URL.
+    When both a cloud key and LLM_URL are set, the cloud API is primary
+    and LLM_URL serves as the automatic fallback (see get_apply_client).
+
+    LLM_MODEL only overrides the cloud model when LLM_URL is NOT set
+    (i.e. when it's clearly meant for the cloud provider). When both
+    are configured, LLM_MODEL is for the local model and the cloud
+    API uses its default.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
-    if gemini_key and not local_url:
+    if gemini_key:
+        # When LLM_URL is also set, LLM_MODEL is for the local model — don't
+        # send "qwen3:8b" to Gemini's API.
+        model = model_override if not local_url else ""
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
+            model or "gemini-2.0-flash",
             gemini_key,
         )
 
-    if openai_key and not local_url:
+    if openai_key:
+        model = model_override if not local_url else ""
         return (
             "https://api.openai.com/v1",
-            model_override or "gpt-4o-mini",
+            model or "gpt-4o-mini",
             openai_key,
         )
 
@@ -183,6 +193,211 @@ class LLMClient:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
+    # -- Native Gemini tool calling -----------------------------------------
+
+    def _chat_with_tools_native_gemini(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ) -> dict:
+        """Call the native Gemini generateContent API with function calling.
+
+        Converts OpenAI-format tool definitions and messages to Gemini's native
+        format, sends the request, and converts the response back to OpenAI
+        format (with tool_calls) so the caller doesn't need to know which
+        backend was used.
+        """
+        import json as _json
+
+        # --- Convert OpenAI tool defs → Gemini function declarations ---
+        func_decls = []
+        for t in tools:
+            fn = t.get("function", {})
+            decl = {"name": fn["name"]}
+            if fn.get("description"):
+                decl["description"] = fn["description"]
+            params = fn.get("parameters", {})
+            if params and params.get("properties"):
+                decl["parameters"] = params
+            func_decls.append(decl)
+
+        # --- Convert OpenAI messages → Gemini contents ---
+        contents: list[dict] = []
+        system_parts: list[dict] = []
+
+        for msg in messages:
+            role = msg["role"]
+            if role == "system":
+                system_parts.append({"text": msg.get("content", "")})
+            elif role == "user":
+                contents.append({"role": "user", "parts": [{"text": msg.get("content", "")}]})
+            elif role == "assistant":
+                parts: list[dict] = []
+                if msg.get("content"):
+                    parts.append({"text": msg["content"]})
+                # Include function calls the assistant made
+                for tc in msg.get("tool_calls", []):
+                    fn = tc.get("function", {})
+                    try:
+                        args = _json.loads(fn.get("arguments", "{}"))
+                    except _json.JSONDecodeError:
+                        args = {}
+                    parts.append({"functionCall": {"name": fn.get("name", ""), "args": args}})
+                if parts:
+                    contents.append({"role": "model", "parts": parts})
+            elif role == "tool":
+                # Gemini expects functionResponse from the "user" role
+                # Try to find the tool name from the tool_call_id in previous messages
+                tool_name = ""
+                tc_id = msg.get("tool_call_id", "")
+                for prev in messages:
+                    for tc in prev.get("tool_calls", []):
+                        if tc.get("id") == tc_id:
+                            tool_name = tc.get("function", {}).get("name", "")
+                            break
+                try:
+                    response_data = _json.loads(msg.get("content", "{}"))
+                except (_json.JSONDecodeError, TypeError):
+                    response_data = {"result": msg.get("content", "")}
+                if not isinstance(response_data, dict):
+                    response_data = {"result": response_data}
+                contents.append({
+                    "role": "user",
+                    "parts": [{"functionResponse": {"name": tool_name, "response": response_data}}],
+                })
+
+        payload: dict = {
+            "contents": contents,
+            "tools": [{"functionDeclarations": func_decls}],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        if system_parts:
+            payload["systemInstruction"] = {"parts": system_parts}
+
+        url = f"{_GEMINI_NATIVE_BASE}/models/{self.model}:generateContent"
+        resp = self._client.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            params={"key": self.api_key},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # --- Convert Gemini response → OpenAI format ---
+        candidate = data["candidates"][0]
+        parts = candidate.get("content", {}).get("parts", [])
+
+        text_content = ""
+        tool_calls = []
+        for part in parts:
+            if "text" in part:
+                text_content += part["text"]
+            elif "functionCall" in part:
+                fc = part["functionCall"]
+                tool_calls.append({
+                    "id": f"gemini_{len(tool_calls)}",
+                    "type": "function",
+                    "function": {
+                        "name": fc.get("name", ""),
+                        "arguments": _json.dumps(fc.get("args", {})),
+                    },
+                })
+
+        result: dict = {"role": "assistant", "content": text_content or None}
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result
+
+    # -- tool-calling API ---------------------------------------------------
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> dict:
+        """Send a chat request with tool definitions (OpenAI function calling format).
+
+        Returns the raw message dict from the response, which may contain
+        'tool_calls' (list of function call requests) and/or 'content' (text).
+
+        For Gemini, uses the native API (reliable function calling).
+        For other providers, uses the OpenAI-compatible endpoint.
+        """
+        # Gemini: always use native API for tool calling (compat layer is unreliable)
+        if self._is_gemini or self._use_native_gemini:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    return self._chat_with_tools_native_gemini(
+                        messages, tools, temperature, max_tokens,
+                    )
+                except httpx.HTTPStatusError as exc:
+                    resp = exc.response
+                    if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
+                        retry_after = resp.headers.get("Retry-After")
+                        wait = float(retry_after) if retry_after else min(
+                            _RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                        log.warning("Gemini rate limited (HTTP %s). Waiting %ds.", resp.status_code, wait)
+                        time.sleep(wait)
+                        continue
+                    raise
+                except httpx.TimeoutException:
+                    if attempt < _MAX_RETRIES - 1:
+                        wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                        log.warning("Gemini timeout, retrying in %ds (%d/%d)", wait, attempt + 1, _MAX_RETRIES)
+                        time.sleep(wait)
+                        continue
+                    raise
+            raise RuntimeError("Gemini tool-calling request failed after all retries")
+
+        # Non-Gemini: OpenAI-compatible endpoint
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "tools": tools,
+        }
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = self._client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
+                    retry_after = (
+                        resp.headers.get("Retry-After")
+                        or resp.headers.get("X-RateLimit-Reset-Requests")
+                    )
+                    wait = float(retry_after) if retry_after else min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                    log.warning("LLM rate limited (HTTP %s). Waiting %ds.", resp.status_code, wait)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]
+            except httpx.TimeoutException:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                    log.warning("LLM timeout, retrying in %ds (%d/%d)", wait, attempt + 1, _MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("LLM tool-calling request failed after all retries")
+
     # -- public API ---------------------------------------------------------
 
     def chat(
@@ -281,17 +496,150 @@ class _GeminiCompatForbidden(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Fallback wrapper
+# ---------------------------------------------------------------------------
+
+_FALLBACK_COOLDOWN = 120  # seconds on fallback before retrying primary
+
+
+class FallbackLLMClient:
+    """LLM client that tries a primary provider and falls back on failure.
+
+    When the primary raises (rate limit, timeout, error), switches to the
+    fallback for a cooldown period, then tries the primary again. This lets
+    you use a free API (Gemini) as primary and a local model as a safety net.
+    """
+
+    def __init__(self, primary: LLMClient, fallback: LLMClient,
+                 cooldown: int = _FALLBACK_COOLDOWN) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self._cooldown = cooldown
+        self._fallback_until: float = 0.0
+
+    @property
+    def model(self) -> str:
+        if time.time() < self._fallback_until:
+            return self.fallback.model
+        return self.primary.model
+
+    @property
+    def base_url(self) -> str:
+        if time.time() < self._fallback_until:
+            return self.fallback.base_url
+        return self.primary.base_url
+
+    def _switch_to_fallback(self, reason: str) -> None:
+        log.warning(
+            "Primary LLM (%s) failed: %s — switching to fallback (%s) for %ds",
+            self.primary.model, reason, self.fallback.model, self._cooldown,
+        )
+        self._fallback_until = time.time() + self._cooldown
+
+    def chat(self, messages: list[dict], **kwargs) -> str:
+        if time.time() >= self._fallback_until:
+            try:
+                result = self.primary.chat(messages, **kwargs)
+                self._fallback_until = 0.0
+                return result
+            except Exception as e:
+                self._switch_to_fallback(str(e)[:120])
+        return self.fallback.chat(messages, **kwargs)
+
+    def chat_with_tools(self, messages: list[dict], tools: list[dict], **kwargs) -> dict:
+        if time.time() >= self._fallback_until:
+            try:
+                result = self.primary.chat_with_tools(messages, tools, **kwargs)
+                self._fallback_until = 0.0
+                return result
+            except Exception as e:
+                self._switch_to_fallback(str(e)[:120])
+        return self.fallback.chat_with_tools(messages, tools, **kwargs)
+
+    def ask(self, prompt: str, **kwargs) -> str:
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self) -> None:
+        self.primary.close()
+        self.fallback.close()
+
+
+# ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
 
 _instance: LLMClient | None = None
+_apply_instance: LLMClient | None = None
 
 
 def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
+    """Return (or create) the module-level LLMClient singleton.
+
+    Used for scoring, tailoring, cover letters, and enrichment.
+    """
     global _instance
     if _instance is None:
         base_url, model, api_key = _detect_provider()
         log.info("LLM provider: %s  model: %s", base_url, model)
         _instance = LLMClient(base_url, model, api_key)
     return _instance
+
+
+def get_apply_client(local: bool = False) -> LLMClient | FallbackLLMClient:
+    """Return (or create) an LLM client for the auto-apply agent.
+
+    Args:
+        local: If True (--local mode), prefer the local model directly.
+               Cloud APIs are too slow for iterative tool-calling loops.
+
+    When local=True:
+      1. APPLY_LLM_URL / APPLY_LLM_MODEL  (dedicated apply endpoint)
+      2. LLM_URL (local model)
+      3. Main provider as last resort
+
+    When local=False (Claude Code mode, or future non-local agents):
+      Main provider with auto-fallback to LLM_URL on rate limits.
+    """
+    global _apply_instance
+    if _apply_instance is not None:
+        return _apply_instance
+
+    apply_url = os.environ.get("APPLY_LLM_URL", "")
+    apply_model = os.environ.get("APPLY_LLM_MODEL", "")
+    local_url = os.environ.get("LLM_URL", "")
+    local_model = os.environ.get("LLM_MODEL", "local-model")
+    local_api_key = os.environ.get("LLM_API_KEY", "")
+
+    # --- Explicit apply override (highest priority in all modes) ---
+    if apply_url:
+        api_key = os.environ.get("APPLY_LLM_API_KEY", local_api_key)
+        model = apply_model or local_model
+        log.info("Apply agent LLM: %s  model: %s", apply_url, model)
+        _apply_instance = LLMClient(apply_url.rstrip("/"), model, api_key)
+        return _apply_instance
+
+    if apply_model:
+        base_url, _, api_key = _detect_provider()
+        log.info("Apply agent LLM: %s  model: %s (override)", base_url, apply_model)
+        _apply_instance = LLMClient(base_url, apply_model, api_key)
+        return _apply_instance
+
+    # --- Local mode: use local model directly ---
+    if local and local_url:
+        log.info("Apply agent (local mode): %s  model: %s", local_url, local_model)
+        _apply_instance = LLMClient(local_url.rstrip("/"), local_model, local_api_key)
+        return _apply_instance
+
+    # --- Default: main provider with auto-fallback ---
+    primary = get_client()
+    primary_is_cloud = primary._is_gemini or primary.base_url.startswith("https://api.openai.com")
+
+    if primary_is_cloud and local_url:
+        log.info("Auto-fallback enabled: %s (%s) → %s (%s) on rate limit",
+                 primary.base_url[:40], primary.model, local_url, local_model)
+        fb_client = LLMClient(local_url.rstrip("/"), local_model, local_api_key)
+        _apply_instance = FallbackLLMClient(primary, fb_client)
+        return _apply_instance
+
+    _apply_instance = primary
+    return _apply_instance
