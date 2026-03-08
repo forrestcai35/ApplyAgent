@@ -23,7 +23,7 @@ MAX_TURNS = 80
 # Max conversation history entries to keep (avoid blowing context window)
 MAX_HISTORY = 60
 # Max characters per tool result
-MAX_TOOL_RESULT_LEN = 6000
+MAX_TOOL_RESULT_LEN = 12000
 
 # Result codes the agent can emit
 RESULT_PATTERNS = re.compile(
@@ -624,7 +624,7 @@ def run_agent(
         else:
             # No tool calls and no result — nudge the model with specific guidance
             nudge_count += 1
-            if nudge_count >= 3:
+            if nudge_count >= 5:
                 _log("\n=== FAILED: NO TOOL CALLS (nudge limit reached) ===")
                 return AgentResult(
                     "failed:no_tool_calls", "\n".join(text_parts),

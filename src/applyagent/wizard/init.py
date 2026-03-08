@@ -172,6 +172,11 @@ def _setup_profile() -> dict:
     # -- Availability --
     profile["availability"] = {
         "earliest_start_date": Prompt.ask("Earliest start date", default="Immediately"),
+        "can_relocate": Confirm.ask(
+            "Are you open to relocating for the right role? "
+            "(If yes, the agent will apply to onsite/hybrid jobs anywhere in the US/Canada)",
+            default=False,
+        ),
     }
 
     # Save
@@ -391,3 +396,18 @@ def run_wizard() -> None:
             border_style="green",
         )
     )
+
+    # Offer to open config files for quick edits
+    console.print("\n[bold]Config files (edit anytime with [cyan]applyagent edit[/cyan]):[/bold]")
+    for label, path in [
+        ("profile  ", PROFILE_PATH),
+        ("searches ", SEARCH_CONFIG_PATH),
+        ("env      ", ENV_PATH),
+    ]:
+        exists = "[green]✓[/green]" if path.exists() else "[dim]–[/dim]"
+        console.print(f"  {exists} {label}  {path}")
+
+    import os, subprocess
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or ""
+    if editor and Confirm.ask(f"\nOpen profile.json in {editor} now?", default=False):
+        subprocess.run([editor, str(PROFILE_PATH)])

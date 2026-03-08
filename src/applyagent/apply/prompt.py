@@ -74,6 +74,8 @@ def _build_profile_summary(profile: dict) -> str:
 
     # Availability
     lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
+    can_relocate = avail.get("can_relocate", False)
+    lines.append(f"Relocation: {'Open to relocation' if can_relocate else 'Not relocating (remote/local only)'}")
 
     # Standard responses
     lines.extend([
@@ -94,31 +96,37 @@ def _build_profile_summary(profile: dict) -> str:
 
 
 def _build_location_check(profile: dict, search_config: dict) -> str:
-    """Build the location eligibility check section of the prompt.
-
-    Uses the accept_patterns from search config to determine which cities
-    are acceptable for hybrid/onsite roles.
-    """
+    """Build the location eligibility check section of the prompt."""
     personal = profile["personal"]
+    avail = profile.get("availability", {})
     location_cfg = search_config.get("location", {})
     accept_patterns = location_cfg.get("accept_patterns", [])
     primary_city = personal.get("city", location_cfg.get("primary", "your city"))
+    can_relocate = avail.get("can_relocate", False)
 
-    # Build the list of acceptable cities for hybrid/onsite
-    if accept_patterns:
-        city_list = ", ".join(accept_patterns)
+    if can_relocate:
+        return """== LOCATION CHECK (do this FIRST before any form) ==
+Read the job page. Determine the work arrangement. Then decide:
+- "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
+- "Hybrid" or "onsite" anywhere in the USA or Canada -> ELIGIBLE. Candidate is open to relocation. Apply.
+- Job is overseas (India, Philippines, Europe, etc.) with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- Cannot determine location -> Continue applying.
+When a form asks about onsite availability for a US/Canada role, answer YES — candidate will relocate."""
     else:
-        city_list = primary_city
+        if accept_patterns:
+            city_list = ", ".join(accept_patterns)
+        else:
+            city_list = primary_city
 
-    return f"""== LOCATION CHECK (do this FIRST before any form) ==
+        return f"""== LOCATION CHECK (do this FIRST before any form) ==
 Read the job page. Determine the work arrangement. Then decide:
 - "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
 - "Hybrid" or "onsite" in {city_list} -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in another city BUT the posting also says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
-- "Onsite only" or "hybrid only" in any city outside the list above with NO remote option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
+- "Hybrid" or "onsite" elsewhere BUT posting says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
+- "Onsite only" or "hybrid only" outside the list above with NO remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
 - City is overseas (India, Philippines, Europe, etc.) with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
-- Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly and let the system reject if needed.
-Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
+- Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly.
+Do NOT fill out forms for jobs clearly onsite in a non-acceptable location. Check EARLY, save time."""
 
 
 def _build_salary_section(profile: dict) -> str:
@@ -167,14 +175,21 @@ def _build_screening_section(profile: dict) -> str:
     """Build the screening questions guidance section."""
     personal = profile["personal"]
     exp = profile.get("experience", {})
+    avail = profile.get("availability", {})
     city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
+    can_relocate = avail.get("can_relocate", False)
+    relocation_note = (
+        f"lives in {city}, open to relocation for the right role"
+        if can_relocate
+        else f"lives in {city}, not open to relocation (remote-only or local roles only)"
+    )
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
+  - Location/relocation: {relocation_note}
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only

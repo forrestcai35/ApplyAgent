@@ -553,13 +553,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # Per-job execution (local model)
 # ---------------------------------------------------------------------------
 
-def run_job_local(job: dict, port: int, worker_id: int = 0,
-                  dry_run: bool = False) -> tuple[str, int]:
-    """Run a job application using a local LLM + Python Playwright.
+def run_job_free(job: dict, port: int, worker_id: int = 0,
+                 dry_run: bool = False) -> tuple[str, int]:
+    """Run a job application using a free LLM (Gemini or local) + Python Playwright.
 
     This is the free alternative to run_job(). No Claude Code CLI, no
-    Node.js, no Playwright MCP server. Uses the existing LLM client
-    (Ollama/llama.cpp/etc.) and connects to Chrome via CDP directly.
+    Node.js, no Playwright MCP server. Uses Gemini (if configured) with
+    fallback to a local LLM, and connects to Chrome via CDP directly.
 
     Returns:
         Tuple of (status_string, duration_ms).
@@ -575,26 +575,37 @@ def run_job_local(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    # Use the compact local prompt (fits in small context windows)
-    agent_prompt = prompt_mod.build_local_prompt(
-        job=job,
-        tailored_resume=resume_text,
-        dry_run=dry_run,
+    # Use Gemini/cloud client with full prompt; fall back to compact prompt for local models
+    llm = get_apply_client(local=False)
+    is_cloud = getattr(llm, '_is_gemini', False) or (
+        hasattr(llm, 'primary') and getattr(llm.primary, '_is_gemini', False)
     )
+    if is_cloud:
+        agent_prompt = prompt_mod.build_prompt(
+            job=job,
+            tailored_resume=resume_text,
+            dry_run=dry_run,
+        )
+    else:
+        agent_prompt = prompt_mod.build_local_prompt(
+            job=job,
+            tailored_resume=resume_text,
+            dry_run=dry_run,
+        )
 
     # Resolve the application URL for pre-navigation
     apply_url = prompt_mod._resolve_apply_url(job)
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action="starting (local)")
-    add_event(f"[W{worker_id}] Starting (local): {job['title'][:40]} @ {job.get('site', '')}")
+                 start_time=time.time(), actions=0, last_action="starting (free)")
+    add_event(f"[W{worker_id}] Starting (free): {job['title'][:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_header = (
         f"\n{'=' * 60}\n"
-        f"[{ts_header}] {job['title']} @ {job.get('site', '')} [LOCAL]\n"
+        f"[{ts_header}] {job['title']} @ {job.get('site', '')} [FREE]\n"
         f"URL: {job.get('application_url') or job['url']}\n"
         f"Score: {job.get('fit_score', 'N/A')}/10\n"
         f"{'=' * 60}\n"
@@ -609,8 +620,6 @@ def run_job_local(job: dict, port: int, worker_id: int = 0,
         screenshot_dir = config.LOG_DIR / f"screenshots-w{worker_id}"
         screenshot_dir.mkdir(parents=True, exist_ok=True)
         browser.connect(screenshot_dir=screenshot_dir)
-
-        llm = get_apply_client(local=True)
 
         def on_action(action_name: str, turn: int):
             ws = get_state(worker_id)
@@ -635,7 +644,7 @@ def run_job_local(job: dict, port: int, worker_id: int = 0,
         duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"local_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        job_log = config.LOG_DIR / f"free_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(result.output, encoding="utf-8")
 
         status = result.status
@@ -647,7 +656,7 @@ def run_job_local(job: dict, port: int, worker_id: int = 0,
 
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
-        add_event(f"[W{worker_id}] LOCAL ERROR: {str(e)[:40]}")
+        add_event(f"[W{worker_id}] FREE ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
         return f"failed:{str(e)[:100]}", duration_ms
     finally:
@@ -750,7 +759,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
             if local:
-                result, duration_ms = run_job_local(
+                result, duration_ms = run_job_free(
                     job, port=port, worker_id=worker_id, dry_run=dry_run)
             else:
                 result, duration_ms = run_job(
