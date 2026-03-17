@@ -32,11 +32,15 @@ RAW_URL = "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file}"
 # ---------------------------------------------------------------------------
 
 def _load_repo_config() -> dict:
-    """Load GitHub repo registry from config/github_repos.yaml."""
-    path = CONFIG_DIR / "github_repos.yaml"
+    """Load GitHub repo registry from ~/.applyagent/github_repos.yaml, parsing fallback if missing."""
+    path = config.GITHUB_REPOS_PATH
     if not path.exists():
-        log.warning("github_repos.yaml not found at %s", path)
-        return {}
+        # Fallback to package config if user hasn't generated it yet
+        path = CONFIG_DIR / "github_repos.yaml"
+        if not path.exists():
+            log.warning("github_repos.yaml not found at %s", path)
+            return {}
+            
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     return data.get("repos", {})
 

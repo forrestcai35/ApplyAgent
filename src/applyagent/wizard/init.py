@@ -21,6 +21,7 @@ from rich.prompt import Confirm, Prompt
 from applyagent.config import (
     APP_DIR,
     ENV_PATH,
+    GITHUB_REPOS_PATH,
     PROFILE_PATH,
     RESUME_PATH,
     RESUME_PDF_PATH,
@@ -235,13 +236,78 @@ def _setup_searches() -> None:
 
 
 # ---------------------------------------------------------------------------
+# GitHub Repos
+# ---------------------------------------------------------------------------
+
+def _setup_github_repos() -> None:
+    """Prompt for GitHub repos and generate github_repos.yaml."""
+    console.print(Panel("[bold]Step 4: GitHub Curated Repositories (optional)[/bold]\nApplyAgent can track markdown/HTML tables of curated jobs on GitHub."))
+    
+    if not Confirm.ask("Do you want to scrape specific GitHub repositories for job lists?", default=True):
+        console.print("[dim]Skipped. The default curated list will be used.[/dim]")
+        from applyagent.config import CONFIG_DIR
+        default_cfg = CONFIG_DIR / "github_repos.yaml"
+        if default_cfg.exists():
+            shutil.copy2(default_cfg, GITHUB_REPOS_PATH)
+        else:
+            GITHUB_REPOS_PATH.write_text("repos: {}\n", encoding="utf-8")
+        return
+
+    repos_raw = Prompt.ask(
+        "Enter GitHub repos (owner/repo form, comma-separated, e.g. simplifyjobs/Summer2025-Internships)",
+        default="simplifyjobs/Summer2025-Internships"
+    )
+    repos = [r.strip() for r in repos_raw.split(",") if r.strip()]
+
+    if not repos:
+        console.print("[yellow]No repos provided. Using the default set.[/yellow]")
+        from applyagent.config import CONFIG_DIR
+        default_cfg = CONFIG_DIR / "github_repos.yaml"
+        if default_cfg.exists():
+            shutil.copy2(default_cfg, GITHUB_REPOS_PATH)
+        else:
+            GITHUB_REPOS_PATH.write_text("repos: {}\n", encoding="utf-8")
+        return
+
+    lines = [
+        "# ApplyAgent GitHub curated repos",
+        "# Add markdown/HTML tables of jobs you want to track here.",
+        "",
+        "repos:",
+    ]
+    for r in repos:
+        parts = r.split("/")
+        if len(parts) != 2:
+            console.print(f"[red]Invalid repo format: {r}. Skipping.[/red]")
+            continue
+        owner, repo = parts
+        lines.append(f"  {owner}_{repo}:")
+        lines.append(f'    owner: "{owner}"')
+        lines.append(f'    repo: "{repo}"')
+        lines.append('    branch: "main"')
+        lines.append('    file: "README.md"')
+        lines.append('    format: "markdown_pipe"')
+        lines.append('    columns:')
+        lines.append('      company: 0')
+        lines.append('      title: 1')
+        lines.append('      location: 2')
+        lines.append('      apply: 3')
+        lines.append("")
+
+    GITHUB_REPOS_PATH.write_text("\n".join(lines), encoding="utf-8")
+    console.print(f"[green]GitHub repos config saved to {GITHUB_REPOS_PATH}[/green]")
+
+
+
+
+# ---------------------------------------------------------------------------
 # AI Features
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
     """Ask about AI scoring/tailoring — optional LLM configuration."""
     console.print(Panel(
-        "[bold]Step 4: AI Features (optional)[/bold]\n"
+        "[bold]Step 5: AI Features (optional)[/bold]\n"
         "An LLM powers job scoring, resume tailoring, and cover letters.\n"
         "Without this, you can still discover and enrich jobs."
     ))
@@ -287,7 +353,7 @@ def _setup_ai_features() -> None:
 def _setup_auto_apply() -> None:
     """Configure autonomous job application (requires Claude Code CLI)."""
     console.print(Panel(
-        "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
+        "[bold]Step 6: Auto-Apply (optional)[/bold]\n"
         "ApplyAgent can autonomously fill and submit job applications\n"
         "using Claude Code as the browser agent."
     ))
@@ -357,11 +423,15 @@ def run_wizard() -> None:
     _setup_searches()
     console.print()
 
-    # Step 4: AI features (optional LLM)
+    # Step 4: GitHub Repos
+    _setup_github_repos()
+    console.print()
+
+    # Step 5: AI features (optional LLM)
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 6: Auto-apply (Claude Code detection)
     _setup_auto_apply()
     console.print()
 
@@ -402,6 +472,7 @@ def run_wizard() -> None:
     for label, path in [
         ("profile  ", PROFILE_PATH),
         ("searches ", SEARCH_CONFIG_PATH),
+        ("github   ", GITHUB_REPOS_PATH),
         ("env      ", ENV_PATH),
     ]:
         exists = "[green]✓[/green]" if path.exists() else "[dim]–[/dim]"

@@ -14,6 +14,7 @@ PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
+GITHUB_REPOS_PATH = APP_DIR / "github_repos.yaml"
 ENV_PATH = APP_DIR / ".env"
 
 # Generated output
