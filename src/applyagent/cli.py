@@ -80,7 +80,7 @@ def run(
         help=(
             "Pipeline stages to run. "
             f"Valid: {', '.join(VALID_STAGES)}, all. "
-            "Defaults to 'all' if omitted."
+            "Defaults to 'discover, dedup, enrich, score' if omitted."
         ),
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
@@ -103,7 +103,7 @@ def run(
 
     from applyagent.pipeline import run_pipeline
 
-    stage_list = stages if stages else ["all"]
+    stage_list = stages if stages else ["discover", "dedup", "enrich", "score"]
 
     # Validate stage names
     for s in stage_list:
@@ -144,39 +144,32 @@ def run(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max jobs to apply to (default: 1). Use -c for unlimited."),
+    limit: Optional[int] = typer.Option(0, "--limit", "-l", help="Max jobs to apply to (default: unlimited)."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel browser workers (each needs its own Chrome). Default: 1."),
     min_score: int = typer.Option(7, "--min-score", help="Only apply to jobs with fit_score >= N. Default: 7."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model for Claude Code mode: haiku, sonnet, opus. Ignored with --free."),
+    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model for Claude Code mode: haiku, sonnet, opus. Ignored with --free."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs every 60s."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Navigate and fill forms but do NOT click Submit."),
     headless: bool = typer.Option(False, "--headless", help="Run Chrome headless (no visible window). Harder to debug."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to one specific job URL instead of pulling from the queue."),
-    skip_tailor: bool = typer.Option(False, "--skip-tailor", help="Use base resume.pdf for jobs missing a tailored resume."),
+    skip_tailor: bool = typer.Option(True, "--skip-tailor", help="Use base resume.pdf for jobs missing a tailored resume."),
     gen: bool = typer.Option(False, "--gen", help="Write the agent prompt to a file instead of running (requires --url). For debugging."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", metavar="URL", help="Manually mark a job URL as applied and exit."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", metavar="URL", help="Manually mark a job URL as failed and exit."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason string for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs so they can be retried."),
-    free: bool = typer.Option(False, "--free", help="Free mode: use Gemini or local LLM instead of Claude Code. No subscription needed."),
-    local: bool = typer.Option(False, "--local", hidden=True, help="Alias for --free (backward compat)."),
 ) -> None:
     """Submit job applications via an AI browser agent.
-
     \b
     MODES
       (default)   Claude Code — spawns the 'claude' CLI with Playwright MCP.
                   Requires: Claude Code CLI + Node.js + Chrome.
-      --free      Free mode — uses Gemini or your local LLM directly.
-                  Requires: GEMINI_API_KEY (or LLM_URL) + Chrome. No Node.js needed.
 
     \b
     COMMON EXAMPLES
       applyagent apply                      Apply to 1 job (Claude Code)
       applyagent apply -l 10               Apply to up to 10 jobs
       applyagent apply -c                  Run forever (continuous mode)
-      applyagent apply --free              Apply using Gemini (free tier)
-      applyagent apply --free -c           Run forever with Gemini
       applyagent apply --dry-run           Fill forms but don't submit
       applyagent apply --url <url>         Apply to one specific job
       applyagent apply --skip-tailor -l 5  Use base resume for next 5 jobs
@@ -215,9 +208,8 @@ def apply(
 
     # --- Full apply mode ---
 
-    use_free = free or local
-    # Check requirements: Tier 3 (Claude Code) or free mode (LLM + Chrome)
-    check_tier(3, "auto-apply", local=use_free)
+    # Check requirements: Tier 3 (Claude Code)
+    check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -278,15 +270,13 @@ def apply(
 
     from applyagent.apply.launcher import main as apply_main
 
-    effective_limit = limit if limit is not None else (0 if continuous else 1)
+    effective_limit = limit if limit is not None else 0
 
-    mode_label = "Free (Gemini/local)" if use_free else f"Claude Code ({model})"
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
-    console.print(f"  Mode:     {mode_label}")
-    console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
+    console.print(f"  Mode:     Claude Code ({model})")
+    console.print(f"  Limit:    {'unlimited' if effective_limit == 0 else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    if not use_free:
-        console.print(f"  Model:    {model}")
+    console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -300,9 +290,8 @@ def apply(
         headless=headless,
         model=model,
         dry_run=dry_run,
-        continuous=continuous,
+        continuous=continuous or (effective_limit == 0),
         workers=workers,
-        local=use_free,
     )
 
 
@@ -524,7 +513,7 @@ def doctor() -> None:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
         results.append(("Claude Code CLI", warn_mark,
-                        "Install from https://claude.ai/code, or use --local for free auto-apply"))
+                        "Install from https://claude.ai/code"))
 
     # Chrome
     try:
@@ -540,7 +529,7 @@ def doctor() -> None:
         results.append(("Node.js (npx)", ok_mark, npx_bin))
     else:
         results.append(("Node.js (npx)", warn_mark,
-                        "Needed for Claude Code mode. Not needed for --local"))
+                        "Needed for Claude Code mode."))
 
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")
@@ -566,15 +555,11 @@ def doctor() -> None:
     tier = get_tier()
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
-    if can_local_apply():
-        console.print("[green]  → Free auto-apply available![/green] Use [bold]applyagent apply --free[/bold] (Gemini/local, no Claude Code needed)")
-
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js, or use --free)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply via Claude Code (needs CLI + Node.js)[/dim]")
-        console.print("[dim]  → Or use --free for free auto-apply with Gemini/local LLM + Chrome[/dim]")
 
     console.print()
 

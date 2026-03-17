@@ -53,9 +53,6 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
-# Skip event for local agent — set on first Ctrl+C, checked between turns
-_skip_event = threading.Event()
-
 # Track active Claude Code processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
 _claude_lock = threading.Lock()
@@ -550,121 +547,6 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
 
 # ---------------------------------------------------------------------------
-# Per-job execution (local model)
-# ---------------------------------------------------------------------------
-
-def run_job_free(job: dict, port: int, worker_id: int = 0,
-                 dry_run: bool = False) -> tuple[str, int]:
-    """Run a job application using a free LLM (Gemini or local) + Python Playwright.
-
-    This is the free alternative to run_job(). No Claude Code CLI, no
-    Node.js, no Playwright MCP server. Uses Gemini (if configured) with
-    fallback to a local LLM, and connects to Chrome via CDP directly.
-
-    Returns:
-        Tuple of (status_string, duration_ms).
-    """
-    from applyagent.apply.browser import BrowserTools
-    from applyagent.apply.agent import run_agent, AgentResult
-    from applyagent.llm import get_apply_client
-
-    # Read tailored resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
-
-    # Use Gemini/cloud client with full prompt; fall back to compact prompt for local models
-    llm = get_apply_client(local=False)
-    is_cloud = getattr(llm, '_is_gemini', False) or (
-        hasattr(llm, 'primary') and getattr(llm.primary, '_is_gemini', False)
-    )
-    if is_cloud:
-        agent_prompt = prompt_mod.build_prompt(
-            job=job,
-            tailored_resume=resume_text,
-            dry_run=dry_run,
-        )
-    else:
-        agent_prompt = prompt_mod.build_local_prompt(
-            job=job,
-            tailored_resume=resume_text,
-            dry_run=dry_run,
-        )
-
-    # Resolve the application URL for pre-navigation
-    apply_url = prompt_mod._resolve_apply_url(job)
-
-    update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action="starting (free)")
-    add_event(f"[W{worker_id}] Starting (free): {job['title'][:40]} @ {job.get('site', '')}")
-
-    worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
-    ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_header = (
-        f"\n{'=' * 60}\n"
-        f"[{ts_header}] {job['title']} @ {job.get('site', '')} [FREE]\n"
-        f"URL: {job.get('application_url') or job['url']}\n"
-        f"Score: {job.get('fit_score', 'N/A')}/10\n"
-        f"{'=' * 60}\n"
-    )
-
-    start = time.time()
-    browser = None
-
-    try:
-        cdp_url = f"http://localhost:{port}"
-        browser = BrowserTools(cdp_url)
-        screenshot_dir = config.LOG_DIR / f"screenshots-w{worker_id}"
-        screenshot_dir.mkdir(parents=True, exist_ok=True)
-        browser.connect(screenshot_dir=screenshot_dir)
-
-        def on_action(action_name: str, turn: int):
-            ws = get_state(worker_id)
-            cur_actions = ws.actions if ws else 0
-            update_state(worker_id,
-                         actions=cur_actions + 1,
-                         last_action=action_name[:35])
-
-        with open(worker_log, "a", encoding="utf-8") as lf:
-            lf.write(log_header)
-            result: AgentResult = run_agent(
-                prompt=agent_prompt,
-                llm=llm,
-                browser=browser,
-                pre_navigate_url=apply_url,
-                cancel_event=_skip_event,
-                on_action=on_action,
-                log_file=lf,
-            )
-
-        elapsed = int(time.time() - start)
-        duration_ms = int((time.time() - start) * 1000)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"free_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
-        job_log.write_text(result.output, encoding="utf-8")
-
-        status = result.status
-        add_event(f"[W{worker_id}] {status.upper()} ({elapsed}s, {result.turns}t): {job['title'][:30]}")
-        update_state(worker_id, status=status.split(":")[0],
-                     last_action=f"{status.upper()} ({elapsed}s)")
-
-        return status, duration_ms
-
-    except Exception as e:
-        duration_ms = int((time.time() - start) * 1000)
-        add_event(f"[W{worker_id}] FREE ERROR: {str(e)[:40]}")
-        update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
-    finally:
-        if browser:
-            browser.close()
-
-
-# ---------------------------------------------------------------------------
 # Permanent failure classification
 # ---------------------------------------------------------------------------
 
@@ -698,8 +580,7 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False,
-                local: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -708,9 +589,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name (ignored in local mode).
+        model: Claude model name.
         dry_run: Don't click Submit.
-        local: Use local LLM + Python Playwright instead of Claude Code.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -751,20 +631,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
-        _skip_event.clear()
 
         chrome_proc = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            if local:
-                result, duration_ms = run_job_free(
-                    job, port=port, worker_id=worker_id, dry_run=dry_run)
-            else:
-                result, duration_ms = run_job(
-                    job, port=port, worker_id=worker_id,
-                    model=model, dry_run=dry_run)
+            result, duration_ms = run_job(
+                job, port=port, worker_id=worker_id,
+                model=model, dry_run=dry_run)
 
             if result == "skipped":
                 mark_skipped(job["url"])
@@ -777,7 +652,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
-                is_rapid = not local and duration_ms < RAPID_FAIL_THRESHOLD_MS
+                is_rapid = duration_ms < RAPID_FAIL_THRESHOLD_MS
                 if is_rapid:
                     rapid_fails += 1
                     release_lock(job["url"])
@@ -840,8 +715,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1,
-         local: bool = False) -> None:
+         poll_interval: int = 60, workers: int = 1) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -849,12 +723,11 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name (ignored in local mode).
+        model: Claude model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
-        local: Use local LLM + Python Playwright instead of Claude Code.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -893,8 +766,6 @@ def main(limit: int = 1, target_url: str | None = None,
 
         if _ctrl_c_state["count"] == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again within 3s to STOP)[/yellow]")
-            # Signal local agent loop to stop between turns
-            _skip_event.set()
             with _claude_lock:
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:
@@ -934,7 +805,6 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
-                    local=local,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -958,7 +828,6 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
-                            local=local,
                         ): i
                         for i in range(workers)
                     }

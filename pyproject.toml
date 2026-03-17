@@ -1,6 +1,6 @@
 [project]
 name = "applyagent"
-version = "0.3.3"
+dynamic = ["version"]
 description = "AI-powered end-to-end job application pipeline"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -40,8 +40,11 @@ Repository = "https://github.com/Pickle-Pixel/ApplyAgent"
 Issues = "https://github.com/Pickle-Pixel/ApplyAgent/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/applyagent"]

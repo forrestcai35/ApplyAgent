@@ -39,10 +39,10 @@ applyagent apply --dry-run  # fill forms without submitting
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyAgent.
 
-### Full Pipeline — Local Model (completely free)
+### Discovery, Scoring, and Tailoring — Local Model (completely free)
 **Requires:** Python 3.11+, Chrome, local LLM server (Ollama/llama.cpp)
 
-Same 6 stages, but auto-apply uses a local model instead of Claude Code. No API keys, no subscriptions, no Node.js. Just your hardware.
+Runs stages 1-5 without any API keys or subscriptions. Uses your local LLM to score jobs, tailor your resume, and write cover letters.
 
 ```bash
 # Start Ollama with a capable model
@@ -54,17 +54,10 @@ ollama pull qwen2.5:32b    # or llama3.1, mistral, etc.
 #   LLM_URL=http://localhost:11434/v1
 #   LLM_MODEL=qwen2.5:32b
 
-applyagent apply --local   # uses local LLM + Python Playwright
+applyagent run   # uses local LLM for scoring and tailoring
 ```
 
-You can also split models — use a small/free model for scoring and a larger one for the agent:
-
-```bash
-# In ~/.applyagent/.env:
-GEMINI_API_KEY=xxx                          # free Gemini for scoring/tailoring
-APPLY_LLM_URL=http://localhost:11434/v1     # local model for browser agent
-APPLY_LLM_MODEL=qwen2.5:32b                # bigger model handles form-filling
-```
+To run auto-apply (stage 6), you will still need to use Claude Code.
 
 ### Discovery + Tailoring Only
 **Requires:** Python 3.11+, Gemini API key (free)
@@ -137,7 +130,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional). For local auto-apply, `APPLY_LLM_URL` and `APPLY_LLM_MODEL` let you use a different model for the browser agent than for scoring.
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional). For local model scoring and tailoring, specify `LLM_URL` and `LLM_MODEL`.
 
 ### Package configs (shipped with ApplyAgent)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -166,16 +159,12 @@ Writes a targeted cover letter per job referencing the specific company, role, a
 ### Auto-Apply
 An AI agent launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
 
-Two agent backends are available:
-
-- **Claude Code** (default): spawns the `claude` CLI with Playwright MCP. Best results but requires an Anthropic subscription + Node.js.
-- **Local model** (`--local`): uses your local LLM (Ollama/llama.cpp) + Python Playwright directly. Completely free, no external dependencies beyond Chrome.
+It spawns the `claude` CLI with Playwright MCP. Best results but requires an Anthropic subscription + Node.js.
 
 ```bash
 applyagent apply                       # Claude Code mode (default)
-applyagent apply --local               # Local model mode (free)
-applyagent apply --local --dry-run     # Local mode, fill forms without submitting
-applyagent apply --local -w 2          # Local mode, 2 parallel workers
+applyagent apply --dry-run             # Fill forms without submitting
+applyagent apply -w 2                  # 2 parallel workers
 
 # Utility modes (no Chrome/agent needed)
 applyagent apply --mark-applied URL    # manually mark a job as applied
@@ -199,7 +188,6 @@ applyagent run --dry-run                # Preview without executing
 applyagent run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applyagent run --validation strict      # Strictest validation (retries on any banned word)
 applyagent apply                        # Launch auto-apply (Claude Code)
-applyagent apply --local                # Launch auto-apply (local LLM, free)
 applyagent apply --workers 3            # Parallel browser workers
 applyagent apply --dry-run              # Fill forms without submitting
 applyagent apply --continuous           # Run forever, polling for new jobs

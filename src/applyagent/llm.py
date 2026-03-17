@@ -24,37 +24,15 @@ log = logging.getLogger(__name__)
 def _detect_provider() -> tuple[str, str, str]:
     """Return (base_url, model, api_key) based on environment variables.
 
-    Priority: cloud APIs first (Gemini > OpenAI), then LLM_URL.
-    When both a cloud key and LLM_URL are set, the cloud API is primary
-    and LLM_URL serves as the automatic fallback (see get_apply_client).
-
-    LLM_MODEL only overrides the cloud model when LLM_URL is NOT set
-    (i.e. when it's clearly meant for the cloud provider). When both
-    are configured, LLM_MODEL is for the local model and the cloud
-    API uses its default.
+    Priority: LLM_URL first (when explicitly set), then cloud APIs.
+    If you set up a local server (LM Studio, Ollama), it's your primary
+    provider for scoring/enrichment. Cloud keys remain available for
+    specific subsystems (e.g. APPLY_LLM_MODEL=gemini-2.0-flash).
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
-
-    if gemini_key:
-        # When LLM_URL is also set, LLM_MODEL is for the local model — don't
-        # send "qwen3:8b" to Gemini's API.
-        model = model_override if not local_url else ""
-        return (
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            model or "gemini-2.0-flash",
-            gemini_key,
-        )
-
-    if openai_key:
-        model = model_override if not local_url else ""
-        return (
-            "https://api.openai.com/v1",
-            model or "gpt-4o-mini",
-            openai_key,
-        )
 
     if local_url:
         return (
@@ -63,9 +41,24 @@ def _detect_provider() -> tuple[str, str, str]:
             os.environ.get("LLM_API_KEY", ""),
         )
 
+    if gemini_key:
+        return (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            model_override or "gemini-2.0-flash",
+            gemini_key,
+        )
+
+    if openai_key:
+        return (
+            "https://api.openai.com/v1",
+            model_override or "gpt-4o-mini",
+            openai_key,
+        )
+
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set LLM_URL (LM Studio: http://localhost:1234/v1, "
+        "Ollama: http://localhost:11434/v1), GEMINI_API_KEY, or OPENAI_API_KEY."
     )
 
 
@@ -569,7 +562,6 @@ class FallbackLLMClient:
 # ---------------------------------------------------------------------------
 
 _instance: LLMClient | None = None
-_apply_instance: LLMClient | None = None
 
 
 def get_client() -> LLMClient:
@@ -585,61 +577,3 @@ def get_client() -> LLMClient:
     return _instance
 
 
-def get_apply_client(local: bool = False) -> LLMClient | FallbackLLMClient:
-    """Return (or create) an LLM client for the auto-apply agent.
-
-    Args:
-        local: If True (--local mode), prefer the local model directly.
-               Cloud APIs are too slow for iterative tool-calling loops.
-
-    When local=True:
-      1. APPLY_LLM_URL / APPLY_LLM_MODEL  (dedicated apply endpoint)
-      2. LLM_URL (local model)
-      3. Main provider as last resort
-
-    When local=False (Claude Code mode, or future non-local agents):
-      Main provider with auto-fallback to LLM_URL on rate limits.
-    """
-    global _apply_instance
-    if _apply_instance is not None:
-        return _apply_instance
-
-    apply_url = os.environ.get("APPLY_LLM_URL", "")
-    apply_model = os.environ.get("APPLY_LLM_MODEL", "")
-    local_url = os.environ.get("LLM_URL", "")
-    local_model = os.environ.get("LLM_MODEL", "local-model")
-    local_api_key = os.environ.get("LLM_API_KEY", "")
-
-    # --- Explicit apply override (highest priority in all modes) ---
-    if apply_url:
-        api_key = os.environ.get("APPLY_LLM_API_KEY", local_api_key)
-        model = apply_model or local_model
-        log.info("Apply agent LLM: %s  model: %s", apply_url, model)
-        _apply_instance = LLMClient(apply_url.rstrip("/"), model, api_key)
-        return _apply_instance
-
-    if apply_model:
-        base_url, _, api_key = _detect_provider()
-        log.info("Apply agent LLM: %s  model: %s (override)", base_url, apply_model)
-        _apply_instance = LLMClient(base_url, apply_model, api_key)
-        return _apply_instance
-
-    # --- Local mode: use local model directly ---
-    if local and local_url:
-        log.info("Apply agent (local mode): %s  model: %s", local_url, local_model)
-        _apply_instance = LLMClient(local_url.rstrip("/"), local_model, local_api_key)
-        return _apply_instance
-
-    # --- Default: main provider with auto-fallback ---
-    primary = get_client()
-    primary_is_cloud = primary._is_gemini or primary.base_url.startswith("https://api.openai.com")
-
-    if primary_is_cloud and local_url:
-        log.info("Auto-fallback enabled: %s (%s) → %s (%s) on rate limit",
-                 primary.base_url[:40], primary.model, local_url, local_model)
-        fb_client = LLMClient(local_url.rstrip("/"), local_model, local_api_key)
-        _apply_instance = FallbackLLMClient(primary, fb_client)
-        return _apply_instance
-
-    _apply_instance = primary
-    return _apply_instance

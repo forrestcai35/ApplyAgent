@@ -12,6 +12,7 @@ Three-tier extraction cascade (cheapest first):
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -456,10 +457,11 @@ def extract_with_llm(page, url: str) -> dict:
     except Exception:
         pass
 
+    max_content = int(os.environ.get("LLM_MAX_CONTENT", 24000))
     prompt = DETAIL_EXTRACT_PROMPT.format(
         url=url,
         title=title,
-        content=content[:30000],
+        content=content[:max_content],
     )
 
     try:
