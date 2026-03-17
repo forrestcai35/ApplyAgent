@@ -87,11 +87,8 @@ Each stage is independent. Run them all or pick what you need.
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Claude Code CLI | Auto-apply (Claude Code mode) | Install from [claude.ai/code](https://claude.ai/code) |
-| Local LLM server | Auto-apply (local mode) | Ollama, llama.cpp, vLLM, or any OpenAI-compatible server |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
-
-**Local auto-apply is completely free.** Use `applyagent apply --local` with any local model. No API keys needed for auto-apply — just Chrome + a local LLM server.
 
 ### Optional
 
