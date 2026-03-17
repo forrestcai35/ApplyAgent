@@ -2,8 +2,6 @@
 
 # ApplyAgent
 
-**Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
-
 [![PyPI version](https://img.shields.io/pypi/v/ApplyAgent?color=blue)](https://pypi.org/project/ApplyAgent/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -79,20 +77,6 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 
 Each stage is independent. Run them all or pick what you need.
 
----
-
-## ApplyAgent vs The Alternatives
-
-| Feature | ApplyAgent | AIHawk | Manual |
-|---------|-----------|--------|--------|
-| Job discovery | 5 boards + Workday + direct sites | LinkedIn only | One board at a time |
-| AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
-| Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
-| Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
-| License | AGPL-3.0 | MIT | N/A |
-
----
 
 ## Requirements
 
@@ -193,6 +177,11 @@ applyagent apply --dry-run              # Fill forms without submitting
 applyagent apply --continuous           # Run forever, polling for new jobs
 applyagent apply --headless             # Headless browser mode
 applyagent apply --url URL              # Apply to a specific job
-applyagent status                       # Pipeline statistics
 applyagent dashboard                    # Open HTML results dashboard
 ```
+
+---
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
