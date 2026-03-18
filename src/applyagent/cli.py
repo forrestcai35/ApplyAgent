@@ -551,7 +551,7 @@ def doctor() -> None:
     console.print()
 
     # Tier summary
-    from applyagent.config import get_tier, TIER_LABELS, can_local_apply
+    from applyagent.config import get_tier, TIER_LABELS
     tier = get_tier()
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
