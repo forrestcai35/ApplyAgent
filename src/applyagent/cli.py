@@ -475,15 +475,16 @@ def doctor() -> None:
     has_local = bool(os.environ.get("LLM_URL"))
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
+        results.append(("LLM", ok_mark, f"Gemini ({model})"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
+        results.append(("LLM", ok_mark, f"OpenAI ({model})"))
     elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+        model = os.environ.get("LLM_MODEL", "default")
+        results.append(("LLM", ok_mark, f"Local: {os.environ.get('LLM_URL')} ({model})"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applyagent/.env (run 'applyagent init')"))
+        results.append(("LLM", fail_mark,
+                        "Set GEMINI_API_KEY or LLM_URL in ~/.applyagent/.env (run 'applyagent init')"))
 
     # --- Apply agent model (optional override) ---
     apply_url = os.environ.get("APPLY_LLM_URL", "")
