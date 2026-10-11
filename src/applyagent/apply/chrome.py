@@ -139,6 +139,9 @@ def setup_worker_profile(worker_id: int) -> Path:
         "SingletonLock", "SingletonSocket", "SingletonCookie",
     }
 
+    if not source.exists():
+        return profile_dir  # Fresh isolated profile when Chrome is not installed.
+
     for item in source.iterdir():
         if item.name in skip:
             continue
@@ -278,10 +281,7 @@ def kill_all_chrome() -> None:
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
 
-    # Sweep base port in case of zombies
-    _kill_on_port(BASE_CDP_PORT)
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -326,9 +326,6 @@ def cleanup_on_exit() -> None:
         for wid, proc in procs.items():
             if proc.poll() is None:
                 _kill_process_tree(proc.pid)
-            _kill_on_port(BASE_CDP_PORT + wid)
 
-        # Sweep base port for any orphan
-        _kill_on_port(BASE_CDP_PORT)
     except Exception:
         pass  # best-effort cleanup, don't crash on exit

@@ -45,3 +45,5 @@ Thumbs.db
 
 # Virtual environment
 .venv/
+.pytest_cache/
+.ruff_cache/

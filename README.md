@@ -2,6 +2,18 @@
 
 # ApplyAgent
 
+## Scheduled discovery
+
+Collect LinkedIn and other configured job boards without applying to jobs:
+
+```bash
+pip install -e '.[discovery]'
+applyagent scheduled-discover --timeout 1800
+```
+
+Requires your own `~/.applyagent/searches.yaml`. Runs have overlap protection, a timeout, persistent URL deduplication, logs, and JSON reports of new roles. See [setup and cron instructions](docs/scheduled-discovery.md).
+
+
 [![PyPI version](https://img.shields.io/pypi/v/ApplyAgent?color=blue)](https://pypi.org/project/ApplyAgent/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -182,3 +194,7 @@ applyagent dashboard                    # Open HTML results dashboard
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
+
+### CLI harness (no separate LLM API key)
+
+Scoring, enrichment, resumes, and cover letters can run through a logged-in Codex or Claude CLI. Set `APPLYAGENT_LLM_BACKEND=codex` or `claude` in your private `.env`. See [harness setup and limits](docs/harness.md). Browser submission supports `applyagent apply --backend codex --limit 10` as well as Claude. The automatic backend follows the configured Codex/Claude text backend. See the harness guide for browser requirements and verification limits.

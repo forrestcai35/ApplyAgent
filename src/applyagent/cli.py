@@ -142,12 +142,23 @@ def run(
         raise typer.Exit(code=1)
 
 
+@app.command("scheduled-discover")
+def scheduled_discover(
+    timeout: int = typer.Option(1800, "--timeout", min=1, help="Maximum run time in seconds."),
+) -> None:
+    """Collect configured sources once, with a lock, timeout, log and JSON shortlist."""
+    from applyagent.scheduled import run_scheduled
+
+    raise typer.Exit(code=run_scheduled(timeout=timeout))
+
+
 @app.command()
 def apply(
     limit: Optional[int] = typer.Option(0, "--limit", "-l", help="Max jobs to apply to (default: unlimited)."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel browser workers (each needs its own Chrome). Default: 1."),
     min_score: int = typer.Option(7, "--min-score", help="Only apply to jobs with fit_score >= N. Default: 7."),
-    model: str = typer.Option("sonnet", "--model", "-m", help="Claude model for Claude Code mode: haiku, sonnet, opus. Ignored with --free."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override for the selected backend."),
+    backend: str = typer.Option("auto", "--backend", help="Application runner: auto, codex, or claude."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs every 60s."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Navigate and fill forms but do NOT click Submit."),
     headless: bool = typer.Option(False, "--headless", help="Run Chrome headless (no visible window). Harder to debug."),
@@ -162,12 +173,14 @@ def apply(
     """Submit job applications via an AI browser agent.
     \b
     MODES
-      (default)   Claude Code — spawns the 'claude' CLI with Playwright MCP.
-                  Requires: Claude Code CLI + Node.js + Chrome.
+      auto        Follow the configured Codex/Claude backend.
+      codex       Codex CLI with Playwright MCP and automatic approval review.
+      claude      Claude Code CLI with Playwright MCP.
+                  Both require Node.js and a Chromium browser.
 
     \b
     COMMON EXAMPLES
-      applyagent apply                      Apply to 1 job (Claude Code)
+      applyagent apply --backend codex -l 10  Use Codex for up to 10 jobs
       applyagent apply -l 10               Apply to up to 10 jobs
       applyagent apply -c                  Run forever (continuous mode)
       applyagent apply --dry-run           Fill forms but don't submit
@@ -183,7 +196,7 @@ def apply(
     """
     _bootstrap()
 
-    from applyagent.config import check_tier, PROFILE_PATH as _profile_path
+    from applyagent.config import PROFILE_PATH as _profile_path
     from applyagent.database import get_connection
 
     # --- Utility modes (no Chrome/Claude needed) ---
@@ -209,7 +222,17 @@ def apply(
     # --- Full apply mode ---
 
     # Check requirements: Tier 3 (Claude Code)
-    check_tier(3, "auto-apply")
+    from applyagent.apply.backend import selected_backend, executable
+    from applyagent.config import get_chrome_path
+    try:
+        backend = selected_backend(None if backend == "auto" else backend)
+        if not executable(backend):
+            raise ValueError(f"{backend} CLI missing; install and sign in")
+        get_chrome_path()
+    except (ValueError, FileNotFoundError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -260,12 +283,14 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        if backend == "codex":
+            from applyagent.apply.backend import codex_command
+            import shlex
+            command = shlex.join(codex_command(BASE_CDP_PORT, _profile_path.parent / "codex-result.txt", model))
+            console.print(f"Start an isolated browser with CDP port {BASE_CDP_PORT}, then run:")
+            console.print(f"  {command} < {shlex.quote(str(prompt_file))}")
+        else:
+            console.print(f"Run Claude with the generated prompt and MCP configuration: {mcp_path}")
         return
 
     from applyagent.apply.launcher import main as apply_main
@@ -273,7 +298,7 @@ def apply(
     effective_limit = limit if limit is not None else 0
 
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
-    console.print(f"  Mode:     Claude Code ({model})")
+    console.print(f"  Mode:     {backend} ({model or 'default model'})")
     console.print(f"  Limit:    {'unlimited' if effective_limit == 0 else effective_limit}")
     console.print(f"  Workers:  {workers}")
     console.print(f"  Model:    {model}")
@@ -292,6 +317,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous or (effective_limit == 0),
         workers=workers,
+        backend=backend,
     )
 
 
@@ -473,7 +499,11 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    from applyagent.harness import selected_backend as text_backend, llm_available
+    if text_backend() in {"codex", "claude"}:
+        results.append(("LLM", ok_mark if llm_available() else fail_mark,
+                        f"{text_backend()} CLI (authentication checked when run)"))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM", ok_mark, f"Gemini ({model})"))
     elif has_openai:
@@ -516,6 +546,10 @@ def doctor() -> None:
         results.append(("Claude Code CLI", warn_mark,
                         "Install from https://claude.ai/code"))
 
+    from applyagent.apply.backend import selected_backend, executable
+    chosen = selected_backend()
+    results.append(("Application backend", ok_mark if executable(chosen) else fail_mark,
+                    f"{chosen} CLI (authentication checked when run)"))
     # Chrome
     try:
         chrome_path = get_chrome_path()

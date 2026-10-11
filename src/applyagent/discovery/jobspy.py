@@ -10,12 +10,13 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
+import pandas as pd
 from jobspy import scrape_jobs
 
 from applyagent import config
-from applyagent.database import get_connection, init_db, store_jobs
+from applyagent.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
             return scrape_jobs(**kwargs)
         except Exception as e:
             err = str(e).lower()
-            transient = any(k in err for k in ("timeout", "429", "proxy", "connection", "reset", "refused"))
+            transient = any(k in err for k in ("timeout", "proxy", "connection", "reset", "refused"))
             if transient and attempt < max_retries:
                 wait = backoff * (attempt + 1)
                 log.warning("Retry %d/%d in %.0fs: %s", attempt + 1, max_retries, wait, e)
@@ -81,63 +82,69 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
 
     Falls back to sensible defaults if not defined in the YAML.
     """
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
+    location_cfg = search_cfg.get("location", {})
+    accept = search_cfg.get("location_accept", location_cfg.get("accept_patterns", []))
+    reject = search_cfg.get("location_reject_non_remote", location_cfg.get("reject_patterns", []))
     return accept, reject
 
 
-def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
+def _location_ok(
+    location: str | None, accept: list[str], reject: list[str],
+    *, is_remote: bool = False, allow_remote: bool = False, accept_unknown: bool = True,
+) -> bool:
     """Check if a job location passes the user's location filter.
 
-    Remote jobs are always accepted. Non-remote jobs must match an accept
-    pattern and not match a reject pattern.
+    Reject patterns take precedence. An absent allowlist accepts any location.
     """
-    if not location:
-        return True  # unknown location -- keep it, let scorer decide
-
-    loc = location.lower()
-
-    # Remote jobs always OK
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
+    loc = (location or "").lower()
 
     # Reject non-remote matches
     for r in reject:
         if r.lower() in loc:
             return False
 
+    if allow_remote and (is_remote or loc.strip() in {"remote", "anywhere", "work from home"}):
+        return True
+    if not location:
+        return accept_unknown
+
     # Accept matches
     for a in accept:
         if a.lower() in loc:
             return True
 
-    # No match -- reject unknown
-    return False
+    # No allowlist means the board search location is sufficient.
+    return not accept
 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
+def _text(value) -> str | None:
+    """Normalize pandas missing values before serializing into SQLite."""
+    return None if value is None or pd.isna(value) else str(value)
+
+
 def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
     for _, row in df.iterrows():
-        url = str(row.get("job_url", ""))
+        url = _text(row.get("job_url"))
         if not url or url == "nan":
             continue
 
-        title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
-        company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
-        location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
+        title = _text(row.get("title"))
+        company = _text(row.get("company"))
+        location_str = _text(row.get("location"))
 
         # Build salary string from min/max
         salary = None
         min_amt = row.get("min_amount")
         max_amt = row.get("max_amount")
-        interval = str(row.get("interval", "")) if str(row.get("interval", "")) != "nan" else ""
-        currency = str(row.get("currency", "")) if str(row.get("currency", "")) != "nan" else ""
+        interval = _text(row.get("interval")) or ""
+        currency = _text(row.get("currency")) or ""
         if min_amt and str(min_amt) != "nan":
             if max_amt and str(max_amt) != "nan":
                 salary = f"{currency}{int(float(min_amt)):,}-{currency}{int(float(max_amt)):,}"
@@ -146,9 +153,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             if interval:
                 salary += f"/{interval}"
 
-        description = str(row.get("description", "")) if str(row.get("description", "")) != "nan" else None
+        description = _text(row.get("description"))
         site_name = str(row.get("site", source_label))
-        is_remote = row.get("is_remote", False)
+        remote_value = row.get("is_remote", False)
+        is_remote = False if pd.isna(remote_value) else bool(remote_value)
 
         site_label = f"{site_name}"
         if is_remote:
@@ -164,7 +172,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             detail_scraped_at = now
 
         # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        apply_url = _text(row.get("job_url_direct"))
 
         try:
             conn.execute(
@@ -195,6 +203,8 @@ def _run_one_search(
     accept_locs: list[str],
     reject_locs: list[str],
     glassdoor_map: dict,
+    exclude_titles: list[str] | None = None,
+    location_options: dict | None = None,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -202,78 +212,66 @@ def _run_one_search(
     if "tier" in s:
         label += f" [tier {s['tier']}]"
 
-    # Split sites: Glassdoor needs simplified location, others use original
-    gd_location = glassdoor_map.get(s["location"], s["location"].split(",")[0])
-    has_glassdoor = "glassdoor" in sites
-    other_sites = [si for si in sites if si != "glassdoor"]
-
+    # Isolate boards so one exception cannot discard another board's results.
     all_dfs = []
-
-    # Run non-Glassdoor sites with original location
-    if other_sites:
+    errors = 0
+    for site in sites:
+        location = s["location"]
+        if site == "glassdoor":
+            location = glassdoor_map.get(location, location.split(",")[0])
         kwargs = {
-            "site_name": other_sites,
+            "site_name": [site],
             "search_term": s["query"],
-            "location": s["location"],
+            "location": location,
             "results_wanted": results_per_site,
             "hours_old": hours_old,
             "description_format": "markdown",
             "country_indeed": defaults.get("country_indeed", "usa"),
-            "verbose": 0,
+            "verbose": 1,
         }
+        if site == "google":
+            kwargs["google_search_term"] = f'{s["query"]} jobs in {location}'
         if s.get("remote"):
             kwargs["is_remote"] = True
+        if site == "indeed" and s.get("remote"):
+            kwargs.pop("hours_old", None)  # Indeed cannot combine remote and age filters.
         if proxy_config:
             kwargs["proxies"] = [proxy_config["jobspy"]]
-        if "linkedin" in other_sites:
-            kwargs["linkedin_fetch_description"] = True
+        if site == "linkedin":
+            kwargs["linkedin_fetch_description"] = defaults.get("linkedin_fetch_description", False)
         try:
-            df = _scrape_with_retry(kwargs, max_retries=max_retries)
-            all_dfs.append(df)
-        except Exception as e:
-            log.error("[%s] (non-gd): %s", label, e)
-
-    # Run Glassdoor separately with simplified location
-    if has_glassdoor:
-        gd_kwargs = {
-            "site_name": ["glassdoor"],
-            "search_term": s["query"],
-            "location": gd_location,
-            "results_wanted": results_per_site,
-            "hours_old": hours_old,
-            "description_format": "markdown",
-            "verbose": 0,
-        }
-        if s.get("remote"):
-            gd_kwargs["is_remote"] = True
-        if proxy_config:
-            gd_kwargs["proxies"] = [proxy_config["jobspy"]]
-        try:
-            gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
-            all_dfs.append(gd_df)
-        except Exception as e:
-            log.error("[%s] (glassdoor): %s", label, e)
+            all_dfs.append(_scrape_with_retry(kwargs, max_retries=max_retries))
+        except Exception:
+            errors += 1
+            log.exception("[%s] (%s) failed", label, site)
 
     if not all_dfs:
         log.error("[%s]: all sites failed", label)
-        return {"new": 0, "existing": 0, "errors": 1, "filtered": 0, "total": 0, "label": label}
+        return {"new": 0, "existing": 0, "errors": errors, "filtered": 0, "total": 0, "label": label}
 
-    import pandas as pd
     import warnings
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         df = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
 
     if len(df) == 0:
         log.info("[%s] 0 results", label)
-        return {"new": 0, "existing": 0, "errors": 0, "filtered": 0, "total": 0, "label": label}
+        return {"new": 0, "existing": 0, "errors": errors, "filtered": 0, "total": 0, "label": label}
 
     # Filter by location before storing
     before = len(df)
+    location_options = location_options or {}
     df = df[df.apply(lambda row: _location_ok(
-        str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
+        _text(row.get("location")), accept_locs, reject_locs,
+        is_remote=False if pd.isna(row.get("is_remote")) else bool(row.get("is_remote")),
+        allow_remote=location_options.get("allow_remote", False),
+        accept_unknown=location_options.get("accept_unknown", True),
     ), axis=1)]
+    if exclude_titles and not df.empty:
+        df = df[~df["title"].fillna("").str.lower().apply(
+            lambda title: any(word.lower() in title for word in exclude_titles)
+        )]
     filtered = before - len(df)
 
     conn = get_connection()
@@ -284,7 +282,7 @@ def _run_one_search(
         msg += f", {filtered} filtered (location)"
     log.info(msg)
 
-    return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
+    return {"new": new, "existing": existing, "errors": errors, "filtered": filtered, "total": before, "label": label}
 
 
 # -- Single query search -----------------------------------------------------
@@ -330,7 +328,7 @@ def search_jobs(
     try:
         df = scrape_jobs(**kwargs)
     except Exception as e:
-        log.error("JobSpy search failed: %s", e)
+        log.exception("JobSpy search failed")
         return {"error": str(e), "total": 0, "new": 0, "existing": 0}
 
     total = len(df)
@@ -374,7 +372,8 @@ def _full_crawl(
     # Build search combinations from config
     queries = search_cfg.get("queries", [])
     locs = search_cfg.get("locations", [])
-    defaults = search_cfg.get("defaults", {})
+    defaults = dict(search_cfg.get("defaults", {}))
+    defaults.setdefault("country_indeed", search_cfg.get("country", "usa"))
     glassdoor_map = search_cfg.get("glassdoor_location_map", {})
     accept_locs, reject_locs = _load_location_config(search_cfg)
 
@@ -405,15 +404,13 @@ def _full_crawl(
     total_new = 0
     total_existing = 0
     total_errors = 0
-    completed = 0
-
-    for s in searches:
+    for completed, s in enumerate(searches, start=1):
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
-            accept_locs, reject_locs, glassdoor_map,
+            accept_locs, reject_locs, glassdoor_map, search_cfg.get("exclude_titles", []),
+            search_cfg.get("location", {}),
         )
-        completed += 1
         total_new += result["new"]
         total_existing += result["existing"]
         total_errors += result["errors"]
@@ -461,7 +458,7 @@ def run_discovery(cfg: dict | None = None) -> dict:
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
+    sites = cfg.get("boards", cfg.get("sites"))
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")

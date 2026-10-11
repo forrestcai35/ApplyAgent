@@ -571,6 +571,10 @@ def get_client() -> LLMClient:
     """
     global _instance
     if _instance is None:
+        from applyagent.harness import HarnessClient, selected_backend
+        if selected_backend() in {"claude", "codex"}:
+            _instance = HarnessClient()
+            return _instance
         base_url, model, api_key = _detect_provider()
         log.info("LLM provider: %s  model: %s", base_url, model)
         _instance = LLMClient(base_url, model, api_key)

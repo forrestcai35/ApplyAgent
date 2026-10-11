@@ -85,6 +85,7 @@ _ANCHOR_TEXT_RE = re.compile(r'<a\s[^>]*>([^<]+)</a>', re.IGNORECASE)
 def _extract_apply_url(cell: str) -> str | None:
     """Extract the direct-apply URL from an apply cell, skipping simplify.jobs redirects."""
     matches = _HREF_RE.findall(cell)
+    matches += re.findall(r"\[[^\]]+\]\((https?://[^\s)]+)\)", cell)
     for url in matches:
         if "simplify.jobs" in url:
             continue
@@ -175,6 +176,7 @@ def _parse_markdown_pipe(text: str, section_cfg: dict) -> list[dict]:
 
     jobs: list[dict] = []
     in_table = False
+    last_company = ""
 
     for line in text.splitlines():
         line = line.strip()
@@ -225,7 +227,11 @@ def _parse_markdown_pipe(text: str, section_cfg: dict) -> list[dict]:
         location = _clean_location(cells[location_idx]) if location_idx is not None and location_idx < len(cells) else ""
         salary = _strip_html(cells[salary_idx]) if salary_idx is not None and salary_idx < len(cells) else None
 
-        full_title = f"{company} — {title}" if company and title else title or company
+        if company in ("↳", "↪", "", "&crarr;"):
+            company = last_company
+        else:
+            last_company = company
+        full_title = title
 
         jobs.append({
             "url": url,
@@ -254,6 +260,7 @@ def _parse_html_table(text: str, columns: dict) -> list[dict]:
     jobs: list[dict] = []
     tbody = table.find("tbody") or table
 
+    last_company = ""
     for row in tbody.find_all("tr"):
         cells = row.find_all("td")
         if not cells:
@@ -281,8 +288,15 @@ def _parse_html_table(text: str, columns: dict) -> list[dict]:
         location = _clean_location(str(cells[location_idx])) if location_idx is not None and location_idx < len(cells) else ""
         salary = cells[salary_idx].get_text(strip=True) if salary_idx is not None and salary_idx < len(cells) else None
 
-        full_title = f"{company} — {title}" if company and title else title or company
+        if company in ("↳", "↪", "", "&crarr;"):
+            company = last_company
+        else:
+            last_company = company
+        full_title = title
 
+        age_idx = columns.get("age")
+        age = cells[age_idx].get_text(strip=True) if age_idx is not None and age_idx < len(cells) else ""
+        age_match = re.fullmatch(r"(\d+)d", age)
         jobs.append({
             "url": url,
             "title": full_title,
@@ -290,6 +304,7 @@ def _parse_html_table(text: str, columns: dict) -> list[dict]:
             "salary": salary,
             "location": location,
             "description": title,
+            "age_days": int(age_match.group(1)) if age_match else None,
         })
 
     return jobs
@@ -340,6 +355,22 @@ def _process_repo(
     else:
         log.warning("%s/%s: unknown format %r", owner, repo, fmt)
         return {"repo": f"{owner}/{repo}", "found": 0, "new": 0, "existing": 0}
+
+    if not all_jobs:
+        return {"repo": f"{owner}/{repo}", "found": 0, "new": 0, "existing": 0,
+                "error": "No parsable open jobs; check table format or source availability"}
+
+    max_age = repo_cfg.get("max_age_days")
+    if max_age is not None:
+        all_jobs = [j for j in all_jobs if j.get("age_days") is None or j["age_days"] <= max_age]
+
+    # Apply the same role/location gate used by the multi-source shortlist.
+    if config.load_search_config().get("quality", {}).get("enabled"):
+        from applyagent.discovery.quality import evaluate, canonical_url
+        all_jobs = [j for j in all_jobs if evaluate({**j, "strategy": "github_repo"})[0]]
+        for job in all_jobs:
+            job["url"] = canonical_url(job["url"])
+        accept_locs, reject_locs = [], []
 
     # Location filter
     if accept_locs or reject_locs:
