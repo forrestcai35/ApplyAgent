@@ -52,6 +52,7 @@ def get_chrome_path() -> str:
         candidates = [
             Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
             Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
         ]
     else:  # Linux
         candidates = []
@@ -204,23 +205,25 @@ def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
     Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
+    Tier 2 (AI Scoring & Tailoring): + agent CLI or LLM provider
     Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    from applyagent.harness import llm_available
+    has_llm = llm_available()
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
+    from applyagent.apply.backend import selected_backend, executable
+    has_agent = executable(selected_backend()) is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_agent and has_chrome:
         return 3
 
     return 2
@@ -245,8 +248,9 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applyagent init[/bold] or set GEMINI_API_KEY")
+    from applyagent.harness import llm_available
+    if required >= 2 and not llm_available():
+        missing.append("LLM runtime — install/login to Claude Code, or configure an API provider")
     if required >= 3:
         if not shutil.which("claude"):
             missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")

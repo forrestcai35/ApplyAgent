@@ -6,7 +6,7 @@ result, and updates the database. Supports parallel workers via --workers.
 
 Two agent backends are available:
   - Claude Code (default): spawns `claude` CLI with Playwright MCP
-  - Local model (--local): uses a local LLM + Python Playwright directly
+  - Codex: bounded codex exec with Playwright MCP and final-message verification
 """
 
 import atexit
@@ -111,16 +111,20 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
+            from applyagent.discovery.quality import canonical_url
+            target = canonical_url(target_url)
+            candidates = conn.execute("""
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+                WHERE tailored_resume_path IS NOT NULL
+                  AND applied_at IS NULL
+                  AND (apply_status IS NULL OR apply_status = 'failed')
+            """).fetchall()
+            row = next((candidate for candidate in candidates
+                        if any(canonical_url(value) == target for value in
+                               (candidate["url"], candidate["application_url"]) if value)), None)
+
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
@@ -135,20 +139,26 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND duplicate_of IS NULL
+                  AND applied_at IS NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
                   {site_clause}
                   {url_clauses}
                 ORDER BY fit_score DESC, url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
+            from applyagent.applications import filter_applications
+            eligible = filter_applications([dict(candidate) for candidate in row])
+            row = eligible[0] if eligible else None
 
+        from applyagent.applications import filter_applications
+        if row and not filter_applications([dict(row)]):
+            row = None
         if not row:
             conn.rollback()
             return None
@@ -313,7 +323,7 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
+            model: str | None = None, dry_run: bool = False, backend: str | None = None) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
@@ -321,6 +331,32 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    from applyagent.apply.backend import selected_backend, run_codex
+    backend = selected_backend(backend)
+    if backend == "codex":
+        worker_dir = reset_worker_dir(worker_id)
+        config.ensure_dirs()
+        resume = job.get("tailored_resume_path")
+        txt = Path(resume).with_suffix(".txt") if resume else None
+        agent_prompt = prompt_mod.build_prompt(
+            job=job, tailored_resume=txt.read_text() if txt and txt.exists() else "",
+            dry_run=dry_run, upload_dir=worker_dir)
+        def register(proc):
+            with _claude_lock:
+                _claude_procs[worker_id] = proc
+        def unregister():
+            with _claude_lock:
+                _claude_procs.pop(worker_id, None)
+        start = time.monotonic()
+        update_state(worker_id, status="applying", job_title=job["title"], start_time=time.time())
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        result = run_codex(agent_prompt, port, worker_dir,
+                           config.LOG_DIR / f"codex_{stamp}_w{worker_id}.jsonl",
+                           model, dry_run, int(os.environ.get("APPLYAGENT_APPLY_TIMEOUT", "600")),
+                           register, unregister)
+        add_event(f"[W{worker_id}] Codex: {result}")
+        return result, int((time.monotonic() - start) * 1000)
+    model = model or "sonnet"
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -557,7 +593,7 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
-    "instant_failure",
+    "instant_failure", "submission_uncertain", "approval_required", "unknown_required_answer", "page_error",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -580,7 +616,7 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str | None = None, dry_run: bool = False, backend: str | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -639,7 +675,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
             result, duration_ms = run_job(
                 job, port=port, worker_id=worker_id,
-                model=model, dry_run=dry_run)
+                model=model, dry_run=dry_run, backend=backend)
 
             if result == "skipped":
                 mark_skipped(job["url"])
@@ -652,7 +688,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
-                is_rapid = duration_ms < RAPID_FAIL_THRESHOLD_MS
+                is_rapid = duration_ms < RAPID_FAIL_THRESHOLD_MS and not _is_permanent_failure(result)
                 if is_rapid:
                     rapid_fails += 1
                     release_lock(job["url"])
@@ -713,9 +749,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 7, headless: bool = False, model: str | None = None,
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1, backend: str | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -804,7 +840,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     min_score=min_score,
                     headless=headless,
                     model=model,
-                    dry_run=dry_run,
+                    dry_run=dry_run, backend=backend,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -827,7 +863,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             min_score=min_score,
                             headless=headless,
                             model=model,
-                            dry_run=dry_run,
+                            dry_run=dry_run, backend=backend,
                         ): i
                         for i in range(workers)
                     }
