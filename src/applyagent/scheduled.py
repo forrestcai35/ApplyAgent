@@ -33,11 +33,19 @@ def validate_searches(cfg: dict) -> None:
     if not isinstance(cfg, dict):
         raise TypeError("Search configuration must be a mapping")
     sources = cfg.get("discovery_sources", ["jobspy"])
-    if not isinstance(sources, list) or not sources or any(s not in {"github", "public", "jobspy"} for s in sources):
-        raise ValueError("discovery_sources must contain github, public, or jobspy")
+    if not isinstance(sources, list) or not sources or any(s not in {"github", "public", "jobspy", "employer_api"} for s in sources):
+        raise ValueError("discovery_sources must contain github, public, jobspy, or employer_api")
+    if 'employer_api' in sources:
+        from applyagent.discovery.employer_apis import endpoint
+        for source in cfg.get('employer_boards', []):
+            endpoint(source)
+        for key in ('max_seconds', 'max_boards'):
+            value = cfg.get('employer_api_settings', {}).get(key, 60 if key == 'max_seconds' else 15)
+            if type(value) is not int or value < 1:
+                raise ValueError(f'employer_api_settings.{key} must be a positive integer')
     quality = cfg.get("quality", {})
-    for key in ("shortlist_limit", "min_score"):
-        value = quality.get(key, 25 if key == "shortlist_limit" else 60)
+    for key in ("shortlist_limit", "min_score", 'max_per_company'):
+        value = quality.get(key, {'shortlist_limit': 25, 'min_score': 60, 'max_per_company': 3}[key])
         if type(value) is not int or value < 1:
             raise ValueError(f"quality.{key} must be a positive integer")
     if "jobspy" not in sources:
@@ -87,6 +95,11 @@ def _worker(report_path: Path) -> int:
                     result = run_github_repos()
                     if not result.get("repos"):
                         result["errors"] = 1
+                elif source == 'employer_api':
+                    from applyagent.discovery.employer_apis import run_employer_apis
+                    result = run_employer_apis(cfg)
+                    if not result.get('sources'):
+                        result['errors'] = 1
                 elif source == "public":
                     from applyagent.discovery.public_sources import run_public_sources
                     result = run_public_sources(cfg)
@@ -98,6 +111,8 @@ def _worker(report_path: Path) -> int:
                         result["errors"] = 1
                 stats["sources"][source] = result
                 stats["errors"] += result.get("errors", 0)
+                if result.get('backoff_skips') and not result.get('errors'):
+                    stats['errors'] += 1  # Cached source outages still mean partial coverage.
                 stats["queries"] += result.get("queries", 0)
             except Exception:
                 log.exception("Discovery source failed: %s", source)
@@ -115,10 +130,15 @@ def _worker(report_path: Path) -> int:
     from applyagent.applications import filter_applications
     jobs = filter_applications(jobs)
     stats["suppressed_applied"] = collected - len(jobs)
+    from applyagent.review import deferred_reason
+    reviewed = [job for job in jobs if not deferred_reason(job)]
+    stats['deferred_reviewed'] = len(jobs) - len(reviewed)
+    jobs = reviewed
     if cfg.get("quality", {}).get("enabled"):
         from applyagent.discovery.quality import rank_jobs
         jobs = rank_jobs(jobs, limit=cfg["quality"].get("shortlist_limit", 25),
-                         min_score=cfg["quality"].get("min_score", 60))
+                         min_score=cfg["quality"].get("min_score", 60),
+                         max_per_company=cfg['quality'].get('max_per_company', 3))
     stats["collected_new"] = collected
     stats["shortlisted_new"] = len(jobs)
     failed = bool(stats.get("errors") or errors.count)

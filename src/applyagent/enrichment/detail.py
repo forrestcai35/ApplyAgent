@@ -18,7 +18,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -27,6 +27,7 @@ from applyagent import config
 from applyagent.config import DB_PATH
 from applyagent.database import get_connection, init_db, ensure_columns
 from applyagent.llm import get_client
+from applyagent.enrichment.browser import posting_browser
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,16 @@ def set_proxy(proxy_str: str | None):
 
 
 # -- URL resolution ----------------------------------------------------------
+
+def application_target(detail_url: str, extracted_url: str | None) -> str | None:
+    """Keep an Ashby requisition from being replaced by a general intake form."""
+    source = urlsplit(detail_url)
+    target = urlsplit(urljoin(detail_url, extracted_url or ''))
+    if (source.hostname == target.hostname == 'jobs.ashbyhq.com'
+            and re.fullmatch(r'/[^/]+/[0-9a-fA-F-]{36}/?(?:application/?)?', source.path)
+            and '/form/' in target.path):
+        return detail_url
+    return urljoin(detail_url, extracted_url) if extracted_url else None
 
 def _load_base_urls() -> dict[str, str | None]:
     """Load site base URLs from config/sites.yaml."""
@@ -638,55 +649,67 @@ def scrape_site_batch(
             launch_opts: dict = {"headless": True}
             if _PROXY_CONFIG:
                 launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
-            browser = p.chromium.launch(**launch_opts)
-            context = browser.new_context(user_agent=UA)
-            page = context.new_page()
+            try:
+                launch_opts["executable_path"] = config.get_chrome_path()
+            except FileNotFoundError:
+                pass  # Playwright may have its own bundled Chromium.
+            with posting_browser(p, launch_opts) as browser:
+                return _scrape_browser_batch(conn, browser, site, jobs, delay, now)
 
-            for i, (url, title) in enumerate(jobs):
-                log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
-
-                result = scrape_detail_page(page, url)
-                stats["processed"] += 1
-
-                tier = result.get("tier_used")
-                status = result["status"]
-                elapsed = result.get("elapsed", 0)
-
-                if tier:
-                    stats["tiers"][tier] = stats["tiers"].get(tier, 0) + 1
-
-                tier_str = f"T{tier}" if tier else "--"
-                desc_len = len(result.get("full_description") or "")
-                apply_str = "yes" if result.get("application_url") else "no"
-                err_str = f" | err={result.get('error')}" if result.get("error") else ""
-
-                log.info("  %s | %s | desc=%s chars | apply=%s | %.1fs%s",
-                         status, tier_str, f"{desc_len:,}", apply_str, elapsed, err_str)
-
-                if status in ("ok", "partial"):
-                    stats[status] += 1
-                    conn.execute(
-                        "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
-                    )
-                else:
-                    stats["error"] += 1
-                    conn.execute(
-                        "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
-                        (result.get("error", "unknown"), now, url),
-                    )
-
-                conn.commit()
-
-                if i < len(jobs) - 1:
-                    time.sleep(delay)
-
-            browser.close()
     finally:
         if own_conn:
             conn.close()
 
+
+def _scrape_browser_batch(conn, browser, site, jobs, delay, now):
+    stats = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    context = browser.new_context(user_agent=UA)
+    page = context.new_page()
+    try:
+        for i, job in enumerate(jobs):
+            url, title = job[:2]
+            detail_url = job[2] if len(job) > 2 and job[2] else url
+            log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
+
+            result = scrape_detail_page(page, detail_url)
+            result['application_url'] = application_target(detail_url, result.get('application_url'))
+            stats["processed"] += 1
+
+            tier = result.get("tier_used")
+            status = result["status"]
+            elapsed = result.get("elapsed", 0)
+
+            if tier:
+                stats["tiers"][tier] = stats["tiers"].get(tier, 0) + 1
+
+            tier_str = f"T{tier}" if tier else "--"
+            desc_len = len(result.get("full_description") or "")
+            apply_str = "yes" if result.get("application_url") else "no"
+            err_str = f" | err={result.get('error')}" if result.get("error") else ""
+
+            log.info("  %s | %s | desc=%s chars | apply=%s | %.1fs%s",
+                     status, tier_str, f"{desc_len:,}", apply_str, elapsed, err_str)
+
+            if status in ("ok", "partial"):
+                stats[status] += 1
+                conn.execute(
+                    "UPDATE jobs SET full_description = ?, application_url = COALESCE(?, application_url), "
+                    "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
+                    (result.get("full_description"), result.get("application_url"), now, url),
+                )
+            else:
+                stats["error"] += 1
+                conn.execute(
+                    "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
+                    (result.get("error", "unknown"), now, url),
+                )
+
+            conn.commit()
+
+            if i < len(jobs) - 1:
+                time.sleep(delay)
+    finally:
+        context.close()
     return stats
 
 

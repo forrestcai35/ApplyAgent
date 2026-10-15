@@ -66,6 +66,9 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
             return scrape_jobs(**kwargs)
         except Exception as e:
             err = str(e).lower()
+            from applyagent.discovery.backoff import failure_kind
+            if failure_kind(err):
+                raise  # Restrictions and DNS failures are not transient retries.
             transient = any(k in err for k in ("timeout", "proxy", "connection", "reset", "refused"))
             if transient and attempt < max_retries:
                 wait = backoff * (attempt + 1)
@@ -205,6 +208,7 @@ def _run_one_search(
     glassdoor_map: dict,
     exclude_titles: list[str] | None = None,
     location_options: dict | None = None,
+    board_backoff=None,
 ) -> dict:
     """Run a single search query and store results in DB."""
     s = search
@@ -216,6 +220,8 @@ def _run_one_search(
     all_dfs = []
     errors = 0
     for site in sites:
+        if board_backoff and not board_backoff.allows(site):
+            continue
         location = s["location"]
         if site == "glassdoor":
             location = glassdoor_map.get(location, location.split(",")[0])
@@ -241,8 +247,10 @@ def _run_one_search(
             kwargs["linkedin_fetch_description"] = defaults.get("linkedin_fetch_description", False)
         try:
             all_dfs.append(_scrape_with_retry(kwargs, max_retries=max_retries))
-        except Exception:
+        except Exception as error:
             errors += 1
+            if board_backoff:
+                board_backoff.failed(site, str(error))
             log.exception("[%s] (%s) failed", label, site)
 
     if not all_dfs:
@@ -401,15 +409,33 @@ def _full_crawl(
     # Ensure DB schema is ready
     init_db()
 
-    total_new = 0
-    total_existing = 0
-    total_errors = 0
+    from applyagent.discovery.backoff import BoardBackoff
+    board_backoff = BoardBackoff()
+    # JobSpy uses colon-separated logger names, which are not descendants.
+    board_loggers = [logging.getLogger(f'JobSpy:{name}') for name in
+                     ('LinkedIn', 'Indeed', 'ZipRecruiter', 'Glassdoor', 'Google', 'Bayt', 'Naukri', 'BDJobs')]
+    for board_logger in board_loggers:
+        board_logger.addHandler(board_backoff)
+    try:
+        return _crawl_searches(searches, sites, results_per_site, hours_old, proxy_config,
+                              defaults, max_retries, accept_locs, reject_locs, glassdoor_map,
+                              search_cfg, board_backoff)
+    finally:
+        for board_logger in board_loggers:
+            board_logger.removeHandler(board_backoff)
+
+
+def _crawl_searches(searches, sites, results_per_site, hours_old, proxy_config,
+                    defaults, max_retries, accept_locs, reject_locs, glassdoor_map,
+                    search_cfg, board_backoff):
+    total_new = total_existing = total_errors = 0
     for completed, s in enumerate(searches, start=1):
         result = _run_one_search(
             s, sites, results_per_site, hours_old,
             proxy_config, defaults, max_retries,
             accept_locs, reject_locs, glassdoor_map, search_cfg.get("exclude_titles", []),
             search_cfg.get("location", {}),
+            board_backoff,
         )
         total_new += result["new"]
         total_existing += result["existing"]
@@ -432,6 +458,9 @@ def _full_crawl(
         "errors": total_errors,
         "db_total": db_total,
         "queries": len(searches),
+        "backoff_skips": board_backoff.skipped,
+        "backoff_failures": board_backoff.failures,
+        "network_unavailable": board_backoff.network_unavailable,
     }
 
 

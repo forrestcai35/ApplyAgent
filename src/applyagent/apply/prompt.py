@@ -5,6 +5,7 @@ how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -77,9 +78,19 @@ def _build_profile_summary(profile: dict) -> str:
     lines.append(f"School: {exp.get('school', 'Not supplied')}")
     lines.append(f"Graduation: {exp.get('graduation_date', 'Not supplied')}")
     lines.append(f"Degree status: {exp.get('graduation_status', 'Not supplied')}")
+    excluded_fields = p.get('application_workflow', {}).get('skip_required_fields', [])
+    if excluded_fields:
+        lines.append('Applicant exclusion preference: skip roles with mandatory ' + ', '.join(excluded_fields) +
+                     ' fields/uploads. Inspect the blank form before entering personal data. '
+                     'Optional fields may be omitted; do not skip for an optional field. '
+                     'If a mandatory excluded field is observed, return '
+                     'RESULT:FAILED:excluded_required_field and record its exact label.')
 
     # Availability
     lines.append(f"Available: {avail.get('earliest_start_date') or avail.get('start_date_preference', 'Not supplied')}")
+    if avail.get('interview_process_timing'):
+        lines.append('Interview/process timing preference: ' + avail['interview_process_timing'])
+        lines.append('This is a desired pace, not evidence of a competing offer or a hard offer-expiration date.')
     can_relocate = avail.get("can_relocate", False)
     lines.append(f"Relocation: {'Open to relocation' if can_relocate else 'Not relocating (remote/local only)'}")
 
@@ -89,7 +100,7 @@ def _build_profile_summary(profile: dict) -> str:
         "Background Check: Do not assert an unknown outcome",
         "Criminal history: Not supplied unless confirmed in profile",
         "Previously Worked Here: Check confirmed employment history",
-        "How Heard: Online Job Board",
+        "How Heard: Use the actual observed discovery source; never invent a referral",
     ])
 
     # EEO
@@ -113,12 +124,19 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     allowed = avail.get("relocation_locations", []) if can_relocate else []
     local = accept_patterns or [primary_city]
     remote_country = profile.get("preferences", {}).get("remote_country", personal.get("country", "Not supplied"))
+    if profile.get('preferences', {}).get('remote_application_policy') == 'us_remote_unless_explicitly_excluded':
+        remote_rule = f"""The applicant accepts applying to explicitly remote roles posted for {remote_country}, including remote postings with a US office city. Do not require the posting to name their state separately.
+Use the actual current city/state. Check all stated country, state, timezone and onsite restrictions. Stop if any explicitly excludes their current location or an approved relocation destination.
+A remote label on a US posting is sufficient to proceed with an application when no exclusion is stated; it is not proof of an employer's unstated state-hiring policy. Never claim a false residence or certify a restriction the applicant cannot meet.
+Remote does not mean worldwide. Skip foreign-only roles or unclear countries."""
+    else:
+        remote_rule = f"""Remote work must explicitly allow residents of {remote_country} and the applicant's actual location, or a confirmed relocation destination.
+Remote does not mean worldwide. Do not assume country/state eligibility."""
     return f"""== LOCATION CHECK (before sharing private information) ==
 Current location: {primary_city}. Approved relocation destinations: {', '.join(allowed) or 'None supplied'}.
 Explicit acceptable local areas: {', '.join(local)}.
 If preferred_location is set, restrict onsite/hybrid roles to that preference: {profile.get('preferences', {}).get('preferred_location', 'Use acceptable local areas')}.
-Remote work must explicitly allow residents of {remote_country} and the applicant's actual location, or a confirmed relocation destination.
-Remote does not mean worldwide. Do not assume country/state eligibility.
+{remote_rule}
 Do not turn relocation willingness into willingness to move anywhere.
 If geography is unclear or outside the approved areas, stop with RESULT:FAILED:not_eligible_location."""
 
@@ -196,6 +214,42 @@ Open-ended questions ("Why do you want this role?", "Tell us about yourself", "W
 EEO/demographics -> Use only explicit confirmed profile answers. East Asian can map to Asian. Current disability status does not establish past history. Omit unknown optional answers or select decline to self-identify. Never infer gender, veteran status, ethnicity or medical history."""
 
 
+
+def _build_confirmed_screening_answers(profile: dict, company: str) -> str:
+    """Pass human-confirmed answers with exact employer scope to either harness."""
+    records = profile.get('screening_answers', {}).get('prior_employment', [])
+    if not isinstance(records, list):
+        raise TypeError('screening_answers.prior_employment must be a list')
+    normalize = lambda name: ''.join(char for char in name.casefold() if char.isalnum())
+    matching = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise TypeError('prior_employment entries must be objects')
+        names = record.get('employer_names', [])
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
+            raise ValueError('prior_employment employer_names must contain nonempty strings')
+        # No substring, domain guess or default No for other employers.
+        if not company or normalize(company) not in {normalize(name) for name in names}:
+            continue
+        if not record.get('human_instruction'):
+            continue
+        if type(record.get('answer')) is not bool or type(record.get('includes_subsidiaries', False)) is not bool:
+            raise ValueError('prior_employment answer and includes_subsidiaries must be booleans')
+        matching.append(record)
+    if len({record['answer'] for record in matching}) > 1:
+        raise ValueError('Conflicting confirmed prior_employment answers for employer')
+    lines = ['== CONFIRMED SCREENING ANSWERS ==',
+             'These are direct applicant confirmations, separate from resume omissions. Use matching answers before declaring a required fact unknown.']
+    for record in matching:
+        scope = 'Employer and its subsidiaries' if record.get('includes_subsidiaries') else 'Named employer only; subsidiary history is not confirmed'
+        lines.append(f"Prior employment at {', '.join(record['employer_names'])}: {'Yes' if record['answer'] else 'No'}. Scope: {scope}.")
+        lines.append('Applicant confirmation: ' + json.dumps(record['human_instruction'], ensure_ascii=False))
+    if not matching:
+        lines.append('No confirmed prior-employment answer for this employer; do not infer No from resume absence.')
+    lines.append('These confirmations do not establish referrals, relatives, legal restrictions, clearance or prior employment at another employer.')
+    return '\n'.join(lines)
+
+
 def _build_answer_policy() -> str:
     """Separate writing tasks from missing facts and recoverable UI failures."""
     return """== ANSWER COMPLETION POLICY ==
@@ -223,19 +277,53 @@ Examples and scope:
   is still unknown. Never default graduation, employment or start dates to today.
 - Earliest start free text: use the saved availability preference with its graduation
   constraint. Do not manufacture a calendar day just to satisfy a date picker.
+- Desired recruiting deadline/process pace: use a saved 'as early as possible'
+  preference for free text. Do not reinterpret that preference as another employer's
+  actual offer deadline or an expiring offer. A forced Yes/No about competing offers
+  still needs a factual answer; never invent one.
 - 'I understand an offer is contingent on a background check': an acknowledgement
   of that condition is not a claim of a clean history or a completed check. Routine
   acknowledgements may be answered within existing authorization; distinguish them
   from legal agreements or consents requiring approval under the active tools.
-- 'Ever worked here?', 'Were you referred?', GPA, honors, compensation, clearance,
-  and past disability history: absence from a resume is not evidence of 'No'.
+- Read the actual recruiting privacy notice before classifying a checkbox. A
+  notice/consent for ordinary recruitment processing of already authorized data
+  at an authorized destination is a data-sharing acknowledgement; do not classify
+  every privacy checkbox as a legally binding agreement. Actual contracts, terms
+  of service, extra data uses and tool-required action-time approvals remain held.
+- 'Ever worked here?': first consult CONFIRMED SCREENING ANSWERS. A matching
+  direct applicant confirmation resolves the answer even when the resume does not
+  list this employer. Preserve employer/subsidiary scope; do not keep requesting
+  confirmation after a matching answer is supplied. Without confirmation, absence
+  from the resume alone does not establish an exhaustive negative history.
+- 'Were you referred?', GPA, honors, compensation, clearance, and past disability
+  history: absence from a resume is not evidence of 'No'.
 - A question requiring the applicant's unaided answer or an assessment is not a
   motivation-writing task. Skip when outside the authorized workflow.
+- A hypothetical professional-process question is not automatically an unaided
+  assessment. Unless the employer explicitly prohibits assistance, draft a
+  prospective 'I would' approach; never claim the applicant actually used those
+  steps on a past project. Mission motivation may connect to documented work
+  without inventing personal beliefs. A past debugging story still requires
+  documented investigation and verification steps, not a plausible reconstruction.
 
 Before reporting unknown_required_answer, verify the field is actually required
 and cannot be answered by categories 1-4. Report its label, available choices,
 missing fact and why it is required. Never use missing facts as a reason to skip
 writing a response supported by the resume.
+
+== AUTONOMOUS DECISIONS ==
+Own the writing and routine choices rather than stopping at a draft. Within an
+authorized application, choose relevant work interests from documented skills and
+location preferences, adapt generated prose to yes/no, multiple-choice or length
+constraints when the question permits it, and generate technical tradeoff answers
+that do not assert an unknown personal belief or history. Distinguish employer
+preferences and nice-to-haves from mandatory qualifications. Do not invent an
+applicant opinion, exact date, experience threshold, assessment answer or consent.
+Read the whole form for mandatory unknowns before entering private data or uploading
+files. When blocked, state the exact blocker and preserve supported answers so the
+operator can move to another distinct suitable requisition. One blocked role must
+not be described as failure of the entire queue. Never retry an uncertain submission,
+an approval rejection, or a restricted site in pursuit of the target.
 
 == VALIDATION RECOVERY ==
 Separate content errors from widget errors. For a known answer that will not stick,
@@ -245,7 +333,94 @@ merely to pass validation. Retry up to three times only when the page explicitly
 shows a validation failure and has not accepted the application. On a timeout after
 Submit, inspect the current page for confirmation; never click Submit again when
 the outcome is uncertain. Record exact field/error text and attempted repairs.
+A visible input value does not prove its autosave succeeded. If a save remains
+pending or errors, stop editing other fields, wait for it to settle, then repair
+only that field through normal UI controls. Do not repeatedly rewrite all fields.
+If an autosave remains failed after bounded recovery, return
+RESULT:FAILED:form_save_failed instead of attempting submission.
+Before Submit, verify required fields, uploads and save indicators again. A submit
+request returning HTTP 200 is NOT proof of acceptance: GraphQL can return validation
+errors with HTTP 200. Inspect the visible success/error state and, if supported,
+read-only browser response evidence. Never replay network requests or call submission
+APIs directly. Missing response evidence means uncertainty, not permission to retry.
+After an approval rejection, preserve the exact rejection and supporting page
+state. Return RESULT:FAILED:approval_required if unresolved; do not label it stuck
+or switch tools/backends to repeat the rejected action.
 """
+
+
+def _build_routine_defaults(profile: dict) -> str:
+    """Render explicitly scoped preferences, never missing history or permission."""
+    defaults = profile.get('application_workflow', {}).get('routine_answer_defaults', {})
+    rules = {
+        'draft_routine_narratives': 'Write motivation, cover letters, strengths and experience summaries from documented facts; do not wait for prewritten prose.',
+        'omit_optional_unknowns': 'Omit optional unknown fields or select the offered decline option; optional fields must not block submission.',
+        'decline_optional_sms': 'Answer No to optional SMS updates; do not accept messaging terms or opt into notifications.',
+        'onsite_after_approved_relocation': 'Answer Yes to office attendance only at an explicitly approved relocation destination, following relocation. Do not promise attendance before graduation-compatible availability.',
+        'willing_to_complete_standard_assessment': 'Answer Yes to willingness to complete a standard technical interview or take-home assessment separately. This does not authorize completing an unaided assessment, installing software, accepting terms or claiming a past assessment result.',
+    }
+    if not isinstance(defaults, dict) or set(defaults) - rules.keys():
+        raise ValueError('routine_answer_defaults accepts only documented routine preference keys')
+    if any(type(value) is not bool for value in defaults.values()):
+        raise ValueError('routine_answer_defaults values must be booleans')
+    lines = ['== ROUTINE ANSWER DEFAULTS ==',
+             'Use enabled defaults within an already authorized application; no repeated preference questions.']
+    for key, rule in rules.items():
+        if not defaults.get(key):
+            continue
+        if key == 'onsite_after_approved_relocation' and not (
+                profile.get('availability', {}).get('can_relocate') and
+                profile.get('availability', {}).get('relocation_locations')):
+            continue
+        lines.append('- ' + rule)
+    lines.extend([
+        '- Source/referral: use the observed discovery source. Do not convert an online discovery into an employee referral.',
+        '- Match question scope: internships and founder work may support relevant experience; projects are not employment. Compare thresholds only when documented durations and duties unambiguously satisfy them.',
+        'These defaults supply routine preferences, not factual history or authorization. Never assume years of professional/frontend experience, previous employer employment, referral status, documentation availability, completed degree, exact dates, GPA, transcript, demographic history or remote-state eligibility.',
+        'Never assume destination/data approval, legal consent, CAPTCHA permission or successful submission. Existing approval rejections, terms holds and uncertain duplicates remain held.',
+        'If a required fact remains unknown, preserve the supported answers and move to another distinct suitable role. An assumptions section does not resolve that missing fact.',
+    ])
+    return '\n'.join(lines)
+
+
+def _build_authorization_section(profile: dict, apply_url: str) -> str:
+    """Keep operator standing consent distinct from applicable tool approvals."""
+    workflow = profile.get('application_workflow', {})
+    standing = workflow.get('standing_submission_authorization', {})
+    lines = ['== AUTHORIZATION ==',
+             'Operator-provided task instruction: ' + os.environ.get(
+                 'APPLYAGENT_TASK_INSTRUCTION', 'Use saved human authorization and the current invocation; never invent authorization.')]
+    if standing.get('enabled') is True and standing.get('human_instruction'):
+        lines.extend([
+            'The applicant has granted standing OPERATOR authorization for routine full-time SWE applications within the saved role/location preferences, using the documented standard application data. Do not ask for employer-by-employer operator approval within that scope.',
+            'Saved human instruction: ' + json.dumps(standing['human_instruction']),
+            'Authorized data categories: ' + ', '.join(standing.get('data_categories', [])),
+            'This changes the applicant workflow, not tool security or approval policy. Verify the live destination, fit, mandatory facts and daily cap. If a tool requires specific destination/data or action-time confirmation beyond this standing scope, stop with RESULT:FAILED:approval_required and identify that concrete requirement. Never pretend a tool action is automatically approved.',
+        ])
+    else:
+        lines.append('Before any private-data entry or upload, verify trusted human authorization for this specific destination and data. Broad autonomy is not authorization to bypass tool requirements. If missing, return RESULT:FAILED:approval_required.')
+    from applyagent.applications import application_identity
+    for approval in workflow.get('authorized_applications', []):
+        if (approval.get('human_instruction') and approval.get('application_url') and
+                application_identity(approval['application_url']) == application_identity(apply_url)):
+            lines.append('Saved exact application approval with human evidence: ' + json.dumps(approval, ensure_ascii=False))
+    lines.append('Do not send separate employer emails. Skip unresolved legal agreements, CAPTCHAs, prior tool rejections, uncertain submissions and required unknown facts. Standing operator consent does not resolve those blockers.')
+    return '\n'.join(lines)
+
+
+def _build_run_limits(dry_run: bool) -> str:
+    if dry_run:
+        return '== VERIFIED RUN LIMITS ==\nDry run: no live submission authorized.'
+    from applyagent.apply.runtime import daily_budget
+    budget = daily_budget()
+    return f"""== VERIFIED RUN LIMITS ==
+The local supervisor verified the durable daily ledger before this application.
+Calendar day: {budget.date} ({budget.timezone}). Daily cap: {budget.limit}.
+Confirmed submissions: {budget.submitted}. Remaining capacity: {budget.remaining}.
+The supervisor owns the shared worker lock and enforces the cap between jobs.
+Use this operator-provided context; you do not need a browser tool to read private
+ledger files. Submit this application at most once. If remaining capacity is zero,
+stop without submission. Never infer success from the remaining-capacity value."""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -259,7 +434,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
@@ -297,7 +471,7 @@ def _resolve_apply_url(job: dict) -> str:
         return base
 
     # Already absolute
-    if raw.startswith("http://") or raw.startswith("https://"):
+    if raw.startswith(("http://", "https://")):
         return raw
 
     # Resolve fragments, relative, and dot-relative paths against the job URL
@@ -329,6 +503,7 @@ def build_prompt(job: dict, tailored_resume: str,
         Complete prompt string for the AI agent.
     """
     profile = config.load_profile()
+    routine_defaults = _build_routine_defaults(profile)
     search_config = config.load_search_config()
     personal = profile["personal"]
 
@@ -396,11 +571,6 @@ def build_prompt(job: dict, tailored_resume: str,
     from applyagent.config import load_blocked_sso
     blocked_sso = load_blocked_sso()
 
-    # Preferred display name
-    preferred_name = personal.get("preferred_name", full_name.split()[0])
-    last_name = full_name.split()[-1] if " " in full_name else ""
-    display_name = f"{preferred_name} {last_name}".strip()
-
     # Dry-run: override submit instruction
     if dry_run:
         submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:FAILED:dry_run_not_submitted. Never report APPLIED for a dry run."
@@ -408,12 +578,15 @@ def build_prompt(job: dict, tailored_resume: str,
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
     apply_url = _resolve_apply_url(job)
+    authorization_section = _build_authorization_section(profile, apply_url)
+    run_limits = _build_run_limits(dry_run)
+    confirmed_answers = _build_confirmed_screening_answers(profile, job.get("company") or "")
 
     prompt = f"""You are an autonomous job application agent. Complete and submit an accurate, authorized application. Write supported narrative answers yourself and repair ordinary form errors without asking the applicant.
 
-== AUTHORIZATION ==
-Operator-provided task instruction: {os.environ.get('APPLYAGENT_TASK_INSTRUCTION', 'Use the authorization supplied with this invocation; do not invent missing authorization.')}
-Before any private-data entry or upload, verify trusted human authorization for this specific destination and data. Broad autonomy is not authorization to bypass tool requirements. If missing, return RESULT:FAILED:approval_required. Do not send separate employer emails. Skip legal agreements requiring fresh approval.
+{authorization_section}
+
+{run_limits}
 
 == JOB ==
 URL: {apply_url}
@@ -433,6 +606,8 @@ Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
 
 == APPLICANT PROFILE ==
 {profile_summary}
+
+{confirmed_answers}
 
 == YOUR MISSION ==
 Submit a complete, accurate application. Use the profile and resume as source data -- adapt to fit each form's format.
@@ -456,6 +631,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 {salary_section}
 
 {screening_section}
+
+{routine_defaults}
 
 {_build_answer_policy()}
 
@@ -497,7 +674,13 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
 - Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
-- Fill ALL fields in ONE browser_fill_form call. Not one at a time.
+- On forms with autosave (including Ashby), fill one field at a time, blur it,
+  and inspect fresh state before the next edit. Wait for visible saving/uploading
+  indicators to clear. Batch only independent fields on forms without autosave.
+- For radio questions, use the visible answer label (for example "No sponsorship
+  needed") in the tool description and select that exact option. A checked=true
+  property means the option is selected, not that the question's answer is Yes.
+  Verify the selected label after the action.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - Human verification: stop with RESULT:CAPTCHA; never bypass it.
 

@@ -86,7 +86,7 @@ class HarnessClient:
                                        stderr=subprocess.PIPE, text=True, cwd=cwd, env=env,
                                        start_new_session=True)
             try:
-                stdout, _ = process.communicate(prompt, timeout=self.timeout)
+                stdout, stderr = process.communicate(prompt, timeout=self.timeout)
             except subprocess.TimeoutExpired as exc:
                 if os.name == 'posix':
                     os.killpg(process.pid, signal.SIGKILL)
@@ -100,7 +100,17 @@ class HarnessClient:
                     raise RuntimeError('Codex harness returned no answer')
                 return answer
         if process.returncode:
-            raise RuntimeError(f'{self.engine} harness exited with code {process.returncode}; check Claude CLI login and availability')
+            # Preserve private diagnostics, not the applicant prompt or provider
+            # output. The public error reports the path, not sensitive details.
+            from datetime import UTC, datetime
+
+            from applyagent import config
+            config.LOG_DIR.mkdir(parents=True, exist_ok=True)
+            diagnostic = config.LOG_DIR / f'harness-error-{datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")}.json'
+            diagnostic.write_text(json.dumps({'backend': self.engine, 'exit_code': process.returncode,
+                                               'stderr': stderr}, indent=2) + '\n')
+            diagnostic.chmod(0o600)
+            raise RuntimeError(f'{self.engine} harness exited with code {process.returncode}; diagnostics: {diagnostic}')
         try:
             result = json.loads(stdout)
         except json.JSONDecodeError as exc:

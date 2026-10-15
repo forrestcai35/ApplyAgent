@@ -153,9 +153,25 @@ def scheduled_discover(
 
 
 @app.command()
+def review_queue(
+    refresh: bool = typer.Option(False, '--refresh', help='Import dated local reviews and packages.'),
+    limit: int = typer.Option(10, '--limit', min=1, help='Maximum held items to display; totals cover the full queue.'),
+) -> None:
+    """Show cached holds without browsers, discovery, scoring or applicant sharing."""
+    from applyagent.review import queue_summary
+    import json
+    summary = queue_summary(refresh=refresh)
+    summary['items'] = sorted(summary['items'], key=lambda item: item['checked_at'], reverse=True)[:limit]
+    console.print_json(json.dumps(summary))
+
+
+@app.command()
 def apply(
+    until_submitted: int = typer.Option(0, "--until-submitted", min=0, help="Keep replenishing prospects until N confirmed submissions; one live worker."),
+    refill: bool = typer.Option(True, "--refill/--no-refill", help="Automatically enrich and score more suitable prospects when the queue empties."),
+    refill_rounds: int = typer.Option(3, "--refill-rounds", min=0, help="Maximum replenishment rounds per run; at most one discovery round."),
     limit: Optional[int] = typer.Option(0, "--limit", "-l", help="Max jobs to apply to (default: unlimited)."),
-    workers: int = typer.Option(1, "--workers", "-w", help="Parallel browser workers (each needs its own Chrome). Default: 1."),
+    workers: int = typer.Option(1, "--workers", "-w", min=1, help="One worker for live submissions; multiple workers supported for dry runs."),
     min_score: int = typer.Option(7, "--min-score", help="Only apply to jobs with fit_score >= N. Default: 7."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Model override for the selected backend."),
     backend: str = typer.Option("auto", "--backend", help="Application runner: auto, codex, or claude."),
@@ -168,7 +184,7 @@ def apply(
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", metavar="URL", help="Manually mark a job URL as applied and exit."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", metavar="URL", help="Manually mark a job URL as failed and exit."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason string for --mark-failed."),
-    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs so they can be retried."),
+    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset transient failures; keep approval, CAPTCHA, unknown-answer and uncertain-submission holds."),
 ) -> None:
     """Submit job applications via an AI browser agent.
     \b
@@ -180,6 +196,7 @@ def apply(
 
     \b
     COMMON EXAMPLES
+      applyagent apply --backend codex --until-submitted 10  Refill until 10 confirmed submissions
       applyagent apply --backend codex -l 10  Use Codex for up to 10 jobs
       applyagent apply -l 10               Apply to up to 10 jobs
       applyagent apply -c                  Run forever (continuous mode)
@@ -191,9 +208,13 @@ def apply(
     UTILITY (no browser started)
       --mark-applied <url>       Mark a job as applied in the database
       --mark-failed <url>        Mark a job as failed (add --fail-reason)
-      --reset-failed             Reset all failed jobs for retry
+      --reset-failed             Reset transient failures for retry
       --gen --url <url>          Dump the agent prompt to a file for debugging
     """
+    if until_submitted and (workers != 1 or dry_run or url or gen):
+        raise typer.BadParameter("--until-submitted requires one live queue worker (no --url/--gen/--dry-run)")
+    if workers != 1 and not dry_run and not any((gen, mark_applied, mark_failed, reset_failed)):
+        raise typer.BadParameter("Live submissions use one worker to enforce the daily cap")
     _bootstrap()
 
     from applyagent.config import PROFILE_PATH as _profile_path
@@ -259,7 +280,7 @@ def apply(
             console.print(f"[green]--skip-tailor:[/green] {updated} job(s) set to use base resume")
 
     # Check 3: Jobs ready to apply (skip for --gen with --url)
-    if not (gen and url):
+    if not (gen and url) and not until_submitted and not refill:
         conn = get_connection()
         ready = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
@@ -308,17 +329,24 @@ def apply(
         console.print(f"  Target:   {url}")
     console.print()
 
-    apply_main(
-        limit=effective_limit,
-        target_url=url,
-        min_score=min_score,
-        headless=headless,
-        model=model,
-        dry_run=dry_run,
-        continuous=continuous or (effective_limit == 0),
-        workers=workers,
-        backend=backend,
-    )
+    try:
+        apply_main(
+            limit=effective_limit,
+            target_url=url,
+            min_score=min_score,
+            headless=headless,
+            model=model,
+            dry_run=dry_run,
+            continuous=continuous or (effective_limit == 0),
+            workers=workers,
+            backend=backend,
+            until_submitted=until_submitted,
+            refill=refill,
+            refill_rounds=refill_rounds,
+        )
+    except (RuntimeError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
 
 
 @app.command()
