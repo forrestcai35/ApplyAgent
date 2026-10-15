@@ -13,6 +13,14 @@ applyagent scheduled-discover --timeout 1800
 
 Requires your own `~/.applyagent/searches.yaml`. Runs have overlap protection, a timeout, persistent URL deduplication, logs, and JSON reports of new roles. See [setup and cron instructions](docs/scheduled-discovery.md).
 
+Discovery can include general SWE, backend, frontend, full-stack and SWE II roles alongside new grads. Explicit requirements of 0–2 years improve ranking; mandatory requirements above two years are screened out, and generic titles with sufficient description remain review candidates. This is a discovery target, not a claim that the applicant meets every requirement. Shortlists default to at most three entries per employer (`quality.max_per_company`).
+
+Add `employer_api` to `discovery_sources` for GET-only public Greenhouse, Lever and Ashby postings. Configure `employer_boards` entries with `provider`, `board` and `name`; for example, `{provider: greenhouse, board: justworks, name: Justworks}`. The collector saves employer descriptions and application URLs directly, respects source backoff, and defaults to at most 15 boards in 60 seconds (`employer_api_settings.max_boards` / `max_seconds`). Ordinary and scheduled discovery both use the configured source list. Generic Workday/smart-extract crawling remains the fallback when no source list is configured.
+
+For recurring application work, run `applyagent review-queue --refresh` first. This imports dated private review reports into `review-state.json`, shows the exact unresolved fields, and defers already-reviewed URLs across discovery, scoring and application selection. The cache records holds only; it never grants employer authorization. Closed or unsuitable postings may be rechecked after seven days; approval, terms and uncertain-duplicate holds need explicit resolution.
+
+The profile's `application_workflow.skip_required_fields` can contain `gpa` and `transcript`. The agent checks the blank form before entering personal data, skips when these are mandatory, and omits optional versions. Live runs default to a 900-second budget, 15 attempts and 12 candidates per refill; configure `max_run_seconds`, `max_attempts_per_run` and `max_refill_candidates` in that section. Budgets are checked between stages, and browser-agent timeouts are capped by the remaining budget. An in-flight enrichment or scoring call can finish after the budget. Discovery remembers HTTP restrictions and parsing outages for 24 hours; sandbox DNS failures stop remaining board requests in that run without persisting a network outage.
+
 
 [![PyPI version](https://img.shields.io/pypi/v/ApplyAgent?color=blue)](https://pypi.org/project/ApplyAgent/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -150,6 +158,12 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
+
+Use `applyagent apply --backend codex --until-submitted 10` to pursue ten confirmed submissions, subject to the shared daily cap. Ordinary apply runs also replenish an empty queue automatically through enrichment and fit scoring, with at most one public discovery round per run. Replenishment checks explicit junior roles first and advances beyond a rejected batch, reviewing at most 100 candidates per round. `--refill-rounds` defaults to 3; `--no-refill` disables replenishment. Runs stop when replenishment yields no suitable prospects, the round limit is reached, or daily capacity is exhausted. `--limit` still counts attempts.
+
+Live runs use one worker and a shared application lock. The daily cap defaults to 10 and counts saved registry entries, receipts, the daily ledger, and applied database records awaiting receipt recovery, using the profile's timezone (default America/Los_Angeles). Interrupted in-progress claims block a new run until their logs are reviewed. These controls apply to ordinary, continuous, and submission-target runs.
+
+Codex confirmations must match observed browser output. Successful submissions automatically save a receipt, update `already_applied.json`, and update the dated application ledger. If receipt persistence fails, the applied database record remains protected from retries; recover the receipt with `scripts/record_verified_application.py JOB_URL LOG_PATH`. When restarting an interrupted run, pass only the remaining submission count. Employer authorization, unknown required answers, and site challenges can still prevent reaching the target. `--reset-failed` resets transient failures only; approval, CAPTCHA, unknown-answer, and uncertain-submission holds remain protected, including when targeting a URL directly.
 An AI agent launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
 
 It spawns the `claude` CLI with Playwright MCP. Best results but requires an Anthropic subscription + Node.js.
@@ -157,12 +171,12 @@ It spawns the `claude` CLI with Playwright MCP. Best results but requires an Ant
 ```bash
 applyagent apply                       # Claude Code mode (default)
 applyagent apply --dry-run             # Fill forms without submitting
-applyagent apply -w 2                  # 2 parallel workers
+applyagent apply --no-refill -l 5       # Use the existing queue only
 
 # Utility modes (no Chrome/agent needed)
 applyagent apply --mark-applied URL    # manually mark a job as applied
 applyagent apply --mark-failed URL     # manually mark a job as failed
-applyagent apply --reset-failed        # reset all failed jobs for retry
+applyagent apply --reset-failed        # reset transient failures; preserve protected holds
 applyagent apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
@@ -181,9 +195,9 @@ applyagent run --dry-run                # Preview without executing
 applyagent run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applyagent run --validation strict      # Strictest validation (retries on any banned word)
 applyagent apply                        # Launch auto-apply (Claude Code)
-applyagent apply --workers 3            # Parallel browser workers
+applyagent apply --refill-rounds 3      # Bound automatic prospect replenishment
 applyagent apply --dry-run              # Fill forms without submitting
-applyagent apply --continuous           # Run forever, polling for new jobs
+applyagent apply --continuous --no-refill # Poll existing queue, subject to daily cap
 applyagent apply --headless             # Headless browser mode
 applyagent apply --url URL              # Apply to a specific job
 applyagent dashboard                    # Open HTML results dashboard
@@ -197,4 +211,4 @@ This project is licensed under the **GNU Affero General Public License v3.0**. S
 
 ### CLI harness (no separate LLM API key)
 
-Scoring, enrichment, resumes, and cover letters can run through a logged-in Codex or Claude CLI. Set `APPLYAGENT_LLM_BACKEND=codex` or `claude` in your private `.env`. See [harness setup and limits](docs/harness.md). Browser submission supports `applyagent apply --backend codex --limit 10` as well as Claude. The automatic backend follows the configured Codex/Claude text backend. See the harness guide for browser requirements and verification limits.
+Scoring, enrichment, resumes, and cover letters can run through a logged-in Codex or Claude CLI. Set `APPLYAGENT_LLM_BACKEND=codex` or `claude` in your private `.env`. See [harness setup and limits](docs/harness.md). Browser submission supports `applyagent apply --backend codex --until-submitted 10` as well as Claude. The automatic backend follows the configured Codex/Claude text backend. See the harness guide for browser requirements and verification limits.

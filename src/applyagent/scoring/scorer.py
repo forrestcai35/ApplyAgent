@@ -34,6 +34,9 @@ IMPORTANT FACTORS:
 - Consider transferable experience (automation, scripting, API work)
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
+- Treat confirmed candidate constraints as requirements: location, remote-state eligibility, employment type, compensation, and graduation timing.
+- Score at most 4 when the posting explicitly conflicts with a candidate requirement, even when technical skills match.
+- Do not infer eligibility from an incomplete description or treat an expected degree as completed.
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]

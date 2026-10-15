@@ -92,6 +92,12 @@ def test_queue_skips_registry_match_and_selects_next(monkeypatch, tmp_path):
     assert launcher.acquire_job()['company'] == 'Fresh'
     assert launcher.acquire_job(target_url='https://example.com/a') is None
     assert launcher._is_permanent_failure('failed:submission_uncertain')
+    c.execute('INSERT INTO jobs (url,title,company,site,tailored_resume_path,fit_score,application_url) '
+              'VALUES (?,?,?,?,?,?,?)',
+              ('https://board.example/alias', 'Alternate title', 'Fresh alias', 'employer',
+               '/resume.pdf', 8, 'https://example.com/b?utm_source=board'))
+    c.commit()
+    assert launcher.acquire_job() is None  # Same requisition already claimed via another board.
 
 
 def test_target_query_identifies_exact_requisition(monkeypatch):
@@ -101,7 +107,8 @@ def test_target_query_identifies_exact_requisition(monkeypatch):
     c.execute('''CREATE TABLE jobs (url TEXT, title TEXT, company TEXT, site TEXT,
         application_url TEXT, tailored_resume_path TEXT, fit_score INTEGER,
         location TEXT, full_description TEXT, cover_letter_path TEXT,
-        apply_status TEXT, applied_at TEXT, agent_id TEXT, last_attempted_at TEXT)''')
+        apply_status TEXT, applied_at TEXT, agent_id TEXT, last_attempted_at TEXT,
+        apply_attempts INTEGER DEFAULT 0)''')
     for key in ('wrong', 'wanted'):
         c.execute('INSERT INTO jobs (url,title,company,tailored_resume_path) VALUES (?,?,?,?)',
                   (f'https://www.indeed.com/viewjob?jk={key}', key, key, '/resume.pdf'))
@@ -120,3 +127,37 @@ def test_cleanup_does_not_kill_an_unowned_browser(monkeypatch):
     chrome.kill_all_chrome()
     chrome.cleanup_on_exit()
     port_kill.assert_not_called()
+
+
+def test_unresolved_approval_preserves_rejection_and_ignores_read_only_checks(tmp_path):
+    log = tmp_path / 'run.jsonl'
+    def event(tool, error=None):
+        return json.dumps({'type': 'item.completed', 'item': {
+            'type': 'mcp_tool_call', 'server': 'playwright', 'tool': tool,
+            'status': 'completed', 'error': error}})
+    denied = {'message': 'This action was rejected due to unacceptable risk. Duplicate risk.'}
+    log.write_text('non-JSON startup log\n' + event('browser_click', denied)
+                   + '\n' + event('browser_snapshot'))
+    assert backend.unresolved_approval(log)['tool'] == 'browser_click'
+    log.write_text(event('browser_fill_form', denied) + '\n' + event('browser_fill_form'))
+    assert backend.unresolved_approval(log) is None
+
+
+def test_failed_turn_reports_unresolved_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, 'executable', lambda _: '/bin/codex')
+    proc = Mock(returncode=0, pid=123)
+    proc.poll.return_value = 0
+    def spawn(cmd, **kwargs):
+        Path(cmd[cmd.index('--output-last-message') + 1]).write_text('RESULT:FAILED:stuck')
+        kwargs['stdout'].write(json.dumps({'type': 'item.completed', 'item': {
+            'type': 'mcp_tool_call', 'server': 'playwright', 'tool': 'browser_click',
+            'error': {'message': 'This action was rejected due to unacceptable risk.'}}}) + '\n')
+        kwargs['stdout'].flush()
+        return proc
+    monkeypatch.setattr(backend.subprocess, 'Popen', spawn)
+    result = backend.run_codex('prompt', 9555, tmp_path, tmp_path / 'run.jsonl',
+                               None, False, 3, Mock(), Mock())
+    assert result == 'failed:approval_required'
+    saved = json.loads((tmp_path / 'run.blocker.json').read_text())
+    assert saved['reported_result'] == 'failed:stuck'
+    assert saved['rejection']['tool'] == 'browser_click'

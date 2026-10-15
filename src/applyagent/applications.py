@@ -3,8 +3,29 @@
 import json
 import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from applyagent import config
+from applyagent.discovery.quality import canonical_url
+
+
+def application_identity(url: str) -> str:
+    parts = urlsplit(url)
+    match = re.fullmatch(r'/[^/]+/([0-9a-fA-F-]{36})(?:/application)?/?', parts.path)
+    if parts.hostname == 'jobs.ashbyhq.com' and match:
+        return 'ashby:' + match[1].lower()
+    match = re.fullmatch(r'/([^/]+)/([0-9a-fA-F-]{36})(?:/apply)?/?', parts.path)
+    if parts.hostname in {'jobs.lever.co', 'jobs.eu.lever.co'} and match:
+        return f'lever:{parts.hostname}:{match[1].lower()}:{match[2].lower()}'
+    if parts.hostname in {'boards.greenhouse.io', 'job-boards.greenhouse.io',
+                          'boards.eu.greenhouse.io', 'job-boards.eu.greenhouse.io'}:
+        match = re.fullmatch(r'/([^/]+)/jobs/(\d+)/?', parts.path)
+        if match:
+            return f'greenhouse:{match[1].lower()}:{match[2]}'
+        query = parse_qs(parts.query)
+        if parts.path == '/embed/job_app' and query.get('for') and query.get('token'):
+            return f"greenhouse:{query['for'][0].lower()}:{query['token'][0]}"
+    return canonical_url(url)
 
 
 def normalized(value: str) -> str:
@@ -27,9 +48,19 @@ def filter_applications(jobs: list[dict], path: Path | None = None) -> list[dict
     if not path.exists():
         return jobs
     records = json.loads(path.read_text())["applications"]
+    submitted_targets = {
+        application_identity(url)
+        for record in records if record.get('submission_confirmed')
+        for url in [record.get('url'), record.get('application_url'),
+                    *(e.get('url') for e in record.get('evidence', []))]
+        if url
+    }
     result = []
     for job in jobs:
         if job.get("applied_at"):
+            continue
+        if any(application_identity(url) in submitted_targets
+               for url in (job.get('url'), job.get('application_url')) if url):
             continue
         history = [r for r in records if company_key(r["company"]) == company_key(job.get("company", ""))]
         title = normalized(job.get("title", ""))

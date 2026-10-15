@@ -29,6 +29,12 @@ def test_explicit_fit_wins_regardless_of_platform():
     assert "Confirm required experience for founding role" in result[0]["review_needed"]
 
 
+def test_junior_candidate_is_prioritized_over_higher_scored_founding_role():
+    roles = [job('Founding Engineer', description='Full description ' * 30),
+             job('Software Engineer I', url='https://example.com/junior')]
+    assert rank_jobs(roles)[0]['title'] == 'Software Engineer I'
+
+
 def test_tracking_dedup_preserves_job_ids():
     assert canonical_url("https://example.com/job?gh_jid=12&utm_source=list#apply") == "https://example.com/job?gh_jid=12"
     assert len(rank_jobs([job(), job(url="https://example.com/jobs/1?utm_source=list")])) == 1

@@ -61,6 +61,24 @@ _UPSTREAM: dict[str, str | None] = {
 
 def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, smart-extract, and GitHub repo scrapers."""
+    from applyagent import config
+    cfg = config.load_search_config()
+    # Use the same configured collectors as scheduled discovery. Don't silently
+    # crawl the generic Workday/smart-extract registry for a customized workflow.
+    if cfg.get('discovery_sources'):
+        from applyagent.discovery import employer_apis, github_repos, jobspy, public_sources
+        collectors = {'employer_api': lambda: employer_apis.run_employer_apis(cfg),
+                      'github': github_repos.run_github_repos,
+                      'public': lambda: public_sources.run_public_sources(cfg),
+                      'jobspy': lambda: jobspy.run_discovery(cfg)}
+        stats = {}
+        for source in cfg['discovery_sources']:
+            try:
+                stats[source] = collectors[source]()
+            except Exception as error:
+                log.error('Discovery source failed: %s (%s)', source, type(error).__name__)
+                stats[source] = {'errors': 1}
+        return stats
     stats: dict = {"jobspy": None, "workday": None, "smartextract": None, "github_repos": None}
 
     # JobSpy
@@ -383,7 +401,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 if name == "discover":
                     sub_errors = [
                         f"{k}: {v}" for k, v in result.items()
-                        if isinstance(v, str) and v.startswith("error")
+                        if (isinstance(v, str) and v.startswith("error")) or
+                           (isinstance(v, dict) and (v.get('errors') or v.get('backoff_skips')))
                     ]
                     if sub_errors:
                         status = "partial"

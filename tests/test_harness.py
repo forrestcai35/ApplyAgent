@@ -45,11 +45,16 @@ def test_rejects_bad_results(client, response):
         client.ask('test')
 
 
-def test_nonzero_exit(client):
+def test_nonzero_exit(client, monkeypatch, tmp_path):
+    from applyagent import config
+    monkeypatch.setattr(config, 'LOG_DIR', tmp_path)
     proc = Mock(returncode=1)
     proc.communicate.return_value = ('', 'private provider detail')
     with patch('applyagent.harness.subprocess.Popen', return_value=proc), pytest.raises(RuntimeError, match='code 1'):
         client.ask('test')
+    saved = json.loads(next(tmp_path.glob('harness-error-*.json')).read_text())
+    assert saved['stderr'] == 'private provider detail'
+    assert 'test' not in json.dumps(saved)
 
 
 def test_timeout_reaps_process_group(client):

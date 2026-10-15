@@ -33,6 +33,7 @@ def codex_command(port: int, output: Path, model: str | None = None) -> list[str
             "-c", 'web_search="disabled"',
             "-c", "features.shell_tool=false", "-c", "features.apps=false",
             "-c", "features.multi_agent=false",
+            "-c", "features.plugins=false",
             "-c", 'mcp_servers.playwright.command="npx"',
             "-c", "mcp_servers.playwright.required=true",
             "-c", "mcp_servers.playwright.startup_timeout_sec=60",
@@ -58,6 +59,33 @@ def parse_result(output: str, dry_run: bool = False) -> str:
                 r"^CONFIRMATION_MESSAGE: \S.+", output, re.MULTILINE):
             return "failed:submission_uncertain"
     return result
+
+
+def unresolved_approval(log_path: Path) -> dict | None:
+    """Preserve a tool rejection when a failed agent turn mislabels it as stuck.
+
+    A subsequent successful call to the same tool clears that tool's rejection.
+    This only classifies failures; it never authorizes a retry or proves submission.
+    """
+    pending = {}
+    if not log_path.exists():
+        return None
+    for line in log_path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        item = event.get('item', {})
+        if event.get('type') != 'item.completed' or item.get('type') != 'mcp_tool_call':
+            continue
+        key = (item.get('server'), item.get('tool'))
+        error = item.get('error')
+        message = error.get('message', '') if isinstance(error, dict) else str(error or '')
+        if 'rejected due to unacceptable risk' in message.lower():
+            pending[key] = {'tool': item.get('tool'), 'reason': message}
+        elif not error and item.get('status') == 'completed':
+            pending.pop(key, None)
+    return next(reversed(list(pending.values())), None) if pending else None
 
 
 def run_codex(prompt: str, port: int, worker_dir: Path, log_path: Path,
@@ -87,7 +115,23 @@ def run_codex(prompt: str, port: int, worker_dir: Path, log_path: Path,
                 return "failed:submission_uncertain"
         if proc.returncode:
             return "failed:submission_uncertain"
-        return parse_result(output.read_text() if output.exists() else "", dry_run)
+        final = output.read_text() if output.exists() else ""
+        result = parse_result(final, dry_run)
+        if result == 'applied':
+            from applyagent.apply.receipts import confirmed_evidence
+            try:
+                confirmed_evidence(log_path, final)
+            except (ValueError, OSError, KeyError):
+                return 'failed:submission_uncertain'
+        if result.startswith('failed:'):
+            rejection = unresolved_approval(log_path)
+            if rejection:
+                log_path.with_suffix('.blocker.json').write_text(json.dumps({
+                    'result': 'failed:approval_required', 'reported_result': result,
+                    'rejection': rejection, 'log': str(log_path),
+                }, indent=2) + '\n')
+                return 'failed:approval_required'
+        return result
     finally:
         unregister()
         if proc is not None and proc.poll() is None:

@@ -23,6 +23,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from rich.console import Console
 from rich.live import Live
@@ -30,6 +31,7 @@ from rich.live import Live
 from applyagent import config
 from applyagent.database import get_connection
 from applyagent.apply import chrome, dashboard, prompt as prompt_mod
+from applyagent.apply.runtime import daily_budget, single_application_run
 from applyagent.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -111,8 +113,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
-            from applyagent.discovery.quality import canonical_url
-            target = canonical_url(target_url)
+            from applyagent.applications import application_identity
+            target = application_identity(target_url)
             candidates = conn.execute("""
                 SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
@@ -120,9 +122,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 WHERE tailored_resume_path IS NOT NULL
                   AND applied_at IS NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
-            """).fetchall()
+                  AND COALESCE(apply_attempts, 0) < ?
+            """, (config.DEFAULTS["max_apply_attempts"],)).fetchall()
             row = next((candidate for candidate in candidates
-                        if any(canonical_url(value) == target for value in
+                        if any(application_identity(value) == target for value in
                                (candidate["url"], candidate["application_url"]) if value)), None)
 
         else:
@@ -154,11 +157,37 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchall()
             from applyagent.applications import filter_applications
             eligible = filter_applications([dict(candidate) for candidate in row])
+            from applyagent.review import deferred_reason
+            eligible = [candidate for candidate in eligible if not deferred_reason(candidate)]
+            from applyagent.applications import application_identity
+            attempted_targets: dict[str, set[str]] = {}
+            for previous in conn.execute(
+                "SELECT url, application_url FROM jobs WHERE applied_at IS NOT NULL "
+                "OR apply_status IN ('applied', 'in_progress', 'failed', 'skipped', 'manual')"
+            ):
+                key = application_identity(previous["application_url"] or previous["url"])
+                attempted_targets.setdefault(key, set()).add(previous["url"])
+            eligible = [candidate for candidate in eligible if not (
+                attempted_targets.get(application_identity(candidate["application_url"] or candidate["url"]), set())
+                - {candidate["url"]}
+            )]
             row = eligible[0] if eligible else None
 
         from applyagent.applications import filter_applications
         if row and not filter_applications([dict(row)]):
             row = None
+        if row:
+            from applyagent.review import deferred_reason
+            if deferred_reason(dict(row)):
+                row = None
+        if row and target_url:
+            identity = application_identity(row["application_url"] or row["url"])
+            if any(application_identity(previous["application_url"] or previous["url"]) == identity
+                   for previous in conn.execute(
+                       "SELECT url, application_url FROM jobs WHERE url != ? AND "
+                       "(applied_at IS NOT NULL OR apply_status IN ('applied', 'in_progress', 'failed', 'skipped', 'manual'))",
+                       (row['url'],))):
+                row = None
         if not row:
             conn.rollback()
             return None
@@ -173,7 +202,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             )
             conn.commit()
             logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
+            if target_url:
+                return None
+            return acquire_job(min_score=min_score, worker_id=worker_id)
 
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
@@ -301,19 +332,23 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
 
 
 def reset_failed() -> int:
-    """Reset all failed jobs so they can be retried.
+    """Reset transient failures only; preserve uncertain submissions and holds.
 
     Returns:
         Number of jobs reset.
     """
     conn = get_connection()
-    cursor = conn.execute("""
+    excluded = sorted(PERMANENT_FAILURES)
+    placeholders = ','.join('?' for _ in excluded)
+    prefixes = ' '.join("AND COALESCE(apply_error, '') NOT LIKE ?" for _ in PERMANENT_PREFIXES)
+    parameters = excluded + [prefix + '%' for prefix in PERMANENT_PREFIXES]
+    cursor = conn.execute(f"""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
                        apply_attempts = 0, agent_id = NULL
         WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
-    """)
+          AND COALESCE(apply_error, '') NOT IN ({placeholders})
+          {prefixes}
+    """, parameters)
     conn.commit()
     return cursor.rowcount
 
@@ -332,6 +367,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'failed:reason', or 'skipped'.
     """
     from applyagent.apply.backend import selected_backend, run_codex
+    apply_timeout = int(os.environ.get('APPLYAGENT_APPLY_TIMEOUT', '600'))
+    if job.get('_run_deadline') is not None:
+        apply_timeout = min(apply_timeout, max(1, int(job['_run_deadline'] - time.monotonic())))
     backend = selected_backend(backend)
     if backend == "codex":
         worker_dir = reset_worker_dir(worker_id)
@@ -350,9 +388,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         start = time.monotonic()
         update_state(worker_id, status="applying", job_title=job["title"], start_time=time.time())
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        job['_confirmation_log'] = config.LOG_DIR / f"codex_{stamp}_w{worker_id}.jsonl"
         result = run_codex(agent_prompt, port, worker_dir,
-                           config.LOG_DIR / f"codex_{stamp}_w{worker_id}.jsonl",
-                           model, dry_run, int(os.environ.get("APPLYAGENT_APPLY_TIMEOUT", "600")),
+                           job['_confirmation_log'],
+                           model, dry_run, apply_timeout,
                            register, unregister)
         add_event(f"[W{worker_id}] Codex: {result}")
         return result, int((time.monotonic() - start) * 1000)
@@ -496,7 +535,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     text_parts.append(line)
                     lf.write(line + "\n")
 
-        proc.wait(timeout=300)
+        proc.wait(timeout=min(300, apply_timeout))
         returncode = proc.returncode
         proc = None
 
@@ -593,7 +632,8 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
-    "instant_failure", "submission_uncertain", "approval_required", "unknown_required_answer", "page_error",
+    "instant_failure", "submission_uncertain", "approval_required", "unknown_required_answer", "page_error", "form_save_failed",
+    "excluded_required_field",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -616,7 +656,9 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str | None = None, dry_run: bool = False, backend: str | None = None) -> tuple[int, int]:
+                model: str | None = None, dry_run: bool = False, backend: str | None = None,
+                until_submitted: int = 0, refill: bool = True,
+                refill_rounds: int = 3) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -631,12 +673,29 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     Returns:
         Tuple of (applied_count, failed_count).
     """
+    if until_submitted and (dry_run or target_url):
+        raise ValueError("Submission targets require live queue mode")
+    if refill_rounds < 0:
+        raise ValueError("refill_rounds must be nonnegative")
     applied = 0
     failed = 0
     continuous = limit == 0
     jobs_done = 0
     empty_polls = 0
     rapid_fails = 0
+    refills = 0
+    try:
+        workflow = config.load_profile().get('application_workflow', {})
+    except FileNotFoundError:
+        workflow = {}
+    run_seconds = workflow.get('max_run_seconds', 900)
+    max_attempts = workflow.get('max_attempts_per_run', 15)
+    if any(type(value) is not int or value < 1 for value in (run_seconds, max_attempts)):
+        raise ValueError('Run time and attempt limits must be positive integers')
+    deadline = time.monotonic() + run_seconds
+    attempts = 0
+    day_baselines = {}
+    day_applied = {}
     port = BASE_CDP_PORT + worker_id
 
     RAPID_FAIL_THRESHOLD_MS = 15_000
@@ -644,8 +703,23 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     RAPID_FAIL_BASE_DELAY = 30
 
     while not _stop_event.is_set():
-        if not continuous and jobs_done >= limit:
+        if time.monotonic() >= deadline or attempts >= max_attempts:
+            add_event(f'[W{worker_id}] Run budget reached; {applied} confirmed, {attempts} attempts')
             break
+        if until_submitted:
+            if applied >= until_submitted:
+                break
+        elif not continuous and jobs_done >= limit:
+            break
+
+        if not dry_run:
+            budget = daily_budget()
+            day_baselines.setdefault(budget.date, budget.submitted)
+            remaining = min(budget.remaining, max(0, budget.limit - (
+                day_baselines[budget.date] + day_applied.get(budget.date, 0))))
+            if not remaining:
+                add_event(f"[W{worker_id}] Daily submission cap reached for {budget.date}")
+                break
 
         update_state(worker_id, status="idle", job_title="", company="",
                      last_action="waiting for job", actions=0)
@@ -653,7 +727,25 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         job = acquire_job(target_url=target_url, min_score=min_score,
                           worker_id=worker_id)
         if not job:
-            if not continuous:
+            if refill and not target_url and refills < refill_rounds:
+                from applyagent.apply.refill import replenish
+                refills += 1
+                add_event(f"[W{worker_id}] Replenishing prospects (round {refills}/{refill_rounds})")
+                try:
+                    prepared = replenish(min_score=min_score, discover=refills == 1,
+                                         max_candidates=workflow.get('max_refill_candidates', 12),
+                                         deadline=deadline)
+                except Exception as error:
+                    logger.exception("Prospect replenishment failed")
+                    update_state(worker_id, status='error', last_action='preparation failed')
+                    raise RuntimeError('Application preparation failed; see private scoring diagnostics') from error
+                if prepared:
+                    continue
+                add_event(f"[W{worker_id}] No additional suitable prospects prepared")
+            if until_submitted or (refill and not target_url):
+                add_event(f"[W{worker_id}] Queue exhausted; {applied} confirmed, target not guaranteed")
+                break
+            if not continuous or target_url:
                 add_event(f"[W{worker_id}] Queue empty")
                 update_state(worker_id, status="done", last_action="queue empty")
                 break
@@ -667,6 +759,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+        attempts += 1
+        job['_run_deadline'] = deadline
 
         chrome_proc = None
         try:
@@ -684,11 +778,23 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
+                if not dry_run:
+                    completed_day = datetime.now(timezone.utc).astimezone(ZoneInfo(budget.timezone)).date().isoformat()
+                    day_baselines.setdefault(completed_day, 0)
+                    day_applied[completed_day] = day_applied.get(completed_day, 0) + 1
+                if job.get('_confirmation_log'):
+                    from applyagent.apply.receipts import record_submission
+                    try:
+                        record_submission(job['url'], job['_confirmation_log'])
+                    except Exception:
+                        # Keep the applied DB record: a bookkeeping failure must never cause reapplication.
+                        logger.exception('Receipt persistence failed for %s; recover from saved log', job['url'])
+                        add_event(f"[W{worker_id}] Submitted; receipt needs recovery from saved log")
                 rapid_fails = 0
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
-                is_rapid = duration_ms < RAPID_FAIL_THRESHOLD_MS and not _is_permanent_failure(result)
+                is_rapid = not until_submitted and duration_ms < RAPID_FAIL_THRESHOLD_MS and not _is_permanent_failure(result)
                 if is_rapid:
                     rapid_fails += 1
                     release_lock(job["url"])
@@ -713,7 +819,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                     rapid_fails = 0
                     reason = result.split(":", 1)[-1] if ":" in result else result
                     mark_result(job["url"], "failed", reason,
-                                permanent=_is_permanent_failure(result),
+                                permanent=bool(until_submitted) or _is_permanent_failure(result),
                                 duration_ms=duration_ms)
                     failed += 1
                     update_state(worker_id, jobs_failed=failed,
@@ -729,7 +835,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
+            mark_result(job["url"], "failed", "launcher_error", permanent=bool(until_submitted))
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
@@ -748,10 +854,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # Main entry point (called from cli.py)
 # ---------------------------------------------------------------------------
 
+@single_application_run
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str | None = None,
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1, backend: str | None = None) -> None:
+         poll_interval: int = 60, workers: int = 1, backend: str | None = None,
+         until_submitted: int = 0, refill: bool = True,
+         refill_rounds: int = 3) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -765,6 +874,10 @@ def main(limit: int = 1, target_url: str | None = None,
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
     """
+    if until_submitted and (workers != 1 or dry_run or target_url):
+        raise ValueError("Submission targets require one live queue worker")
+    if not dry_run and workers != 1:
+        raise ValueError("Live applications require one worker to enforce the shared daily cap")
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
     _stop_event.clear()
@@ -772,7 +885,10 @@ def main(limit: int = 1, target_url: str | None = None,
     config.ensure_dirs()
     console = Console()
 
-    if continuous:
+    if until_submitted:
+        effective_limit = 0
+        mode_label = f"{until_submitted} confirmed submissions"
+    elif continuous:
         effective_limit = 0
         mode_label = "continuous"
     else:
@@ -840,7 +956,8 @@ def main(limit: int = 1, target_url: str | None = None,
                     min_score=min_score,
                     headless=headless,
                     model=model,
-                    dry_run=dry_run, backend=backend,
+                    dry_run=dry_run, backend=backend, until_submitted=until_submitted,
+                    refill=refill, refill_rounds=refill_rounds,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -864,6 +981,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run, backend=backend,
+                            refill=False,
                         ): i
                         for i in range(workers)
                     }
@@ -886,7 +1004,7 @@ def main(limit: int = 1, target_url: str | None = None,
 
         totals = get_totals()
         console.print(
-            f"\n[bold]Done: {total_applied} applied, {total_failed} failed "
+            f"\n[bold]Run ended: {total_applied} applied, {total_failed} failed "
             f"(${totals['cost']:.3f})[/bold]"
         )
         console.print(f"Logs: {config.LOG_DIR}")

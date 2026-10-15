@@ -40,22 +40,58 @@
     "target_role": "software engineer"
   },
   "skills_boundary": {
-    "languages": ["Python", "SQL", "JavaScript"],
-    "frameworks": ["FastAPI", "Flask", "React"],
-    "devops": ["Docker", "AWS", "CI/CD"],
-    "databases": ["PostgreSQL", "MongoDB"],
-    "tools": ["Git", "Linux"]
+    "languages": [
+      "Python",
+      "SQL",
+      "JavaScript"
+    ],
+    "frameworks": [
+      "FastAPI",
+      "Flask",
+      "React"
+    ],
+    "devops": [
+      "Docker",
+      "AWS",
+      "CI/CD"
+    ],
+    "databases": [
+      "PostgreSQL",
+      "MongoDB"
+    ],
+    "tools": [
+      "Git",
+      "Linux"
+    ]
   },
   "resume_facts": {
-    "preserved_companies": ["Company A", "Company B"],
-    "preserved_projects": ["Project X", "Project Y"],
+    "preserved_companies": [
+      "Company A",
+      "Company B"
+    ],
+    "preserved_projects": [
+      "Project X",
+      "Project Y"
+    ],
     "preserved_school": "Your University",
-    "real_metrics": ["50% improvement", "10x faster"]
+    "real_metrics": [
+      "50% improvement",
+      "10x faster"
+    ]
   },
   "eeo_voluntary": {
     "gender": "Decline to self-identify",
     "race_ethnicity": "Decline to self-identify",
     "veteran_status": "I am not a protected veteran",
     "disability_status": "I do not wish to answer"
+  },
+  "application_workflow": {
+    "routine_answer_defaults": {
+      "draft_routine_narratives": true,
+      "omit_optional_unknowns": true,
+      "decline_optional_sms": true,
+      "onsite_after_approved_relocation": false,
+      "willing_to_complete_standard_assessment": false
+    }
   }
 }
